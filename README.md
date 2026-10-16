@@ -4,12 +4,12 @@ A small LLM inference engine, built to understand how engines like vLLM work:
 an OpenAI-compatible streaming API, continuous batching, and (in progress) our
 own forward pass with a paged KV cache. Every change is measured.
 
-It starts from a **baseline server** (`server.py` in the first commit): a
-FastAPI server that streams tokens over SSE from `POST /v1/completions` and
-batches users continuously on the Mac GPU (MPS). Each user keeps their own KV
-cache, and every decode round pads all caches to the same length, runs the
-model, and cuts the padding off again. Everything after that is measured
-against it.
+It starts from a **baseline server** (`baseline_server.py`, kept unchanged so it
+can be re-run for comparisons): a FastAPI server that streams tokens over SSE
+from `POST /v1/completions` and batches users continuously on the Mac GPU
+(MPS). Each user keeps their own KV cache, and every decode round pads all
+caches to the same length, runs the model, and cuts the padding off again.
+Everything after that is measured against it.
 
 ## How to run it
 
@@ -23,6 +23,9 @@ In a second terminal:
 curl -N -X POST localhost:8080/v1/completions -H "Content-Type: application/json" \
      -d '{"prompt": "The cat sat on the", "max_tokens": 20}'
 ```
+
+`python3 baseline_server.py` runs the baseline instead, on the same port, so
+run only one at a time.
 
 Load test it (the server must be running):
 
