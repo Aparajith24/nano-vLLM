@@ -16,17 +16,17 @@ from pydantic import BaseModel, Field
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 HOST, PORT = "127.0.0.1", 8080
-MODEL_NAME = "distilgpt2"
+MODEL_NAME = "HuggingFaceTB/SmolLM2-135M"
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 MAX_BATCH = 30
+CONTEXT_LENGTH = 1024
 DEFAULT_MAX_TOKENS = 16
 TEMPERATURE, TOP_K = 0.7, 10
 WELCOME_TEXT = "hi! welcome"
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(DEVICE).eval()
-CONTEXT_LENGTH = model.config.n_positions
-N_LAYERS = model.config.n_layer
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.float32).to(DEVICE).eval()
+N_LAYERS = model.config.num_hidden_layers
 EOS = tokenizer.eos_token_id
 
 
@@ -102,7 +102,7 @@ class BatchEngine:
 
     def prefill(self, seat):
         """Read the whole prompt once, keep its KV cache, and pick the first token."""
-        out = model.transformer(torch.tensor([seat.prompt_ids], device=DEVICE), use_cache=True)
+        out = model.model(torch.tensor([seat.prompt_ids], device=DEVICE), use_cache=True)
         seat.cache, seat.length = layer_kv(out.past_key_values), len(seat.prompt_ids)
         self.accept(seat, sample(model.lm_head(out.last_hidden_state[:, -1]))[0])
 
@@ -117,8 +117,8 @@ class BatchEngine:
         mask = torch.tensor([[0] * (longest - s.length) + [1] * (s.length + 1) for s in seats], device=DEVICE)
         positions = torch.tensor([[s.length] for s in seats], device=DEVICE)
         inputs = torch.tensor([[s.last_token] for s in seats], device=DEVICE)
-        out = model.transformer(input_ids=inputs, past_key_values=cache, attention_mask=mask,
-                                position_ids=positions, use_cache=True)
+        out = model.model(input_ids=inputs, past_key_values=cache, attention_mask=mask,
+                          position_ids=positions, use_cache=True)
         next_tokens = sample(model.lm_head(out.last_hidden_state[:, -1]))
         batch_kv = layer_kv(out.past_key_values)
         for i, (seat, token_id) in enumerate(zip(seats, next_tokens)):
@@ -217,7 +217,7 @@ async def completions(request: CompletionRequest):
     if len(prompt_ids) + request.max_tokens > CONTEXT_LENGTH:
         raise HTTPException(status_code=400, detail=(
             f"prompt ({len(prompt_ids)} tokens) + max_tokens ({request.max_tokens}) is over "
-            f"{MODEL_NAME}'s context length of {CONTEXT_LENGTH} tokens"))
+            f"this server's context limit of {CONTEXT_LENGTH} tokens"))
     if request.prompt.strip():
         source = model_tokens(prompt_ids, request.max_tokens)
     else:
