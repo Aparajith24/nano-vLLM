@@ -9,6 +9,7 @@ import httpx
 
 URL = "http://127.0.0.1:8080/v1/completions"
 PROMPT = "The future of AI inference is"
+SYSTEM_SENTENCE = "You are a helpful assistant who answers questions about the history of printing."
 RESULTS = Path(__file__).parent / "results"
 
 
@@ -20,12 +21,19 @@ def percentile(values, p):
     return ordered[min(len(ordered) - 1, round(p / 100 * (len(ordered) - 1)))]
 
 
-async def one_user(client, max_tokens, start_line):
+def prompt_for(user, system_repeats):
+    """The plain benchmark prompt, or a long shared system prompt followed by this user's own question."""
+    if not system_repeats:
+        return PROMPT
+    return " ".join([SYSTEM_SENTENCE] * system_repeats) + f" Question {user}: what happened in the year {1400 + user}?"
+
+
+async def one_user(client, max_tokens, start_line, prompt):
     """Wait for the starting signal, stream one answer, and record when each token arrived."""
     await start_line.wait()
     sent = time.perf_counter()
     arrivals, completion_tokens = [], 0
-    body = {"prompt": PROMPT, "max_tokens": max_tokens, "stream": True}
+    body = {"prompt": prompt, "max_tokens": max_tokens, "stream": True}
     async with client.stream("POST", URL, json=body) as response:
         async for line in response.aiter_lines():
             if not line.startswith("data: ") or line == "data: [DONE]":
@@ -38,12 +46,13 @@ async def one_user(client, max_tokens, start_line):
     return {"sent": sent, "arrivals": arrivals, "done": time.perf_counter(), "completion_tokens": completion_tokens}
 
 
-async def run_level(users, max_tokens):
+async def run_level(users, max_tokens, system_repeats=0):
     """Start this many users at the same moment and wait for all of them to finish."""
     start_line = asyncio.Event()
     limits = httpx.Limits(max_connections=users, max_keepalive_connections=users)
     async with httpx.AsyncClient(timeout=None, limits=limits) as client:
-        tasks = [asyncio.create_task(one_user(client, max_tokens, start_line)) for _ in range(users)]
+        tasks = [asyncio.create_task(one_user(client, max_tokens, start_line, prompt_for(user, system_repeats)))
+                 for user in range(users)]
         await asyncio.sleep(0.1)
         start_line.set()
         return await asyncio.gather(*tasks)
@@ -83,7 +92,7 @@ async def main(args):
     await run_level(1, 5)
     rows, raw = [], {}
     for users in args.users:
-        requests = await run_level(users, args.max_tokens)
+        requests = await run_level(users, args.max_tokens, args.system_repeats)
         rows.append(summarize(users, requests))
         raw[users] = requests
         print(f"done: {users} users")
@@ -91,7 +100,8 @@ async def main(args):
     print_table(rows)
     RESULTS.mkdir(exist_ok=True)
     path = RESULTS / f"{args.label}.json"
-    path.write_text(json.dumps({"label": args.label, "prompt": PROMPT, "max_tokens": args.max_tokens,
+    path.write_text(json.dumps({"label": args.label, "prompt": prompt_for(0, args.system_repeats),
+                                "max_tokens": args.max_tokens,
                                 "summary": rows, "raw": raw}, indent=1))
     print(f"saved {path}")
 
@@ -102,4 +112,6 @@ if __name__ == "__main__":
     parser.add_argument("--users", type=int, nargs="+", default=[1, 10, 30, 40])
     parser.add_argument("--max-tokens", type=int, default=100)
     parser.add_argument("--pause", type=float, default=2.0)
+    parser.add_argument("--system-repeats", type=int, default=0,
+                        help="start every prompt with the same system sentence repeated this many times")
     asyncio.run(main(parser.parse_args()))
