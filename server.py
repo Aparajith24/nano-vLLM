@@ -4,30 +4,33 @@ import queue
 import time
 import traceback
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from threading import Thread
 
 import torch
-import torch.nn.functional as F
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from transformers import AutoTokenizer
+
+from blocks import DEFAULT_NUM_BLOCKS, BlockAllocator, KVPool
+from model import SmolLM2
 
 HOST, PORT = "127.0.0.1", 8080
 MODEL_NAME = "HuggingFaceTB/SmolLM2-135M"
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 MAX_BATCH = 30
+NUM_BLOCKS = DEFAULT_NUM_BLOCKS
 CONTEXT_LENGTH = 1024
 DEFAULT_MAX_TOKENS = 16
 TEMPERATURE, TOP_K = 0.7, 10
 WELCOME_TEXT = "hi! welcome"
-PARTS = ("pad/concat", "forward", "sampling", "slice-back", "sending")
+PARTS = ("forward", "sampling", "sending")
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.float32).to(DEVICE).eval()
-N_LAYERS = model.config.num_hidden_layers
+model = SmolLM2.from_pretrained(MODEL_NAME, device=DEVICE)
 EOS = tokenizer.eos_token_id
 
 
@@ -40,12 +43,12 @@ class CompletionRequest(BaseModel):
 
 
 class Seat:
-    """One user inside the engine: their KV cache, how far they have got, and where to send their tokens."""
+    """One user inside the engine: their block table, how far they have got, and where to send their tokens."""
 
     def __init__(self, prompt_ids, max_tokens, loop):
         self.prompt_ids, self.max_tokens, self.loop = prompt_ids, max_tokens, loop
         self.tokens = asyncio.Queue()
-        self.cache, self.length, self.last_token, self.generated = None, 0, None, 0
+        self.table, self.length, self.last_token, self.generated = [], 0, None, 0
         self.done = self.cancelled = False
 
     def send(self, token_id):
@@ -58,11 +61,6 @@ def sample(logits):
     top_logits, top_ids = torch.topk(logits / TEMPERATURE, TOP_K)
     choice = torch.multinomial(torch.softmax(top_logits, dim=-1), 1)
     return top_ids.gather(-1, choice).view(-1).tolist()
-
-
-def layer_kv(cache):
-    """The (keys, values) pair of every layer in a transformers cache."""
-    return [(layer.keys, layer.values) for layer in cache.layers]
 
 
 def gpu_wait():
@@ -104,34 +102,63 @@ class Stopwatches:
 
 
 class BatchEngine:
-    """Continuous batching: one thread runs rounds; each round seats people from the waiting line, then gives every seated user one token."""
+    """Continuous batching over a paged KV cache: each round seats people whose blocks fit, then gives every seated user one token."""
 
     def __init__(self):
-        self.waiting, self.seated, self.stopwatches = queue.Queue(), [], Stopwatches()
+        self.waiting, self.line, self.seated, self.stopwatches = queue.Queue(), deque(), [], Stopwatches()
+        self.allocator = BlockAllocator(NUM_BLOCKS)
+        c = model.config
+        self.pool = KVPool(c.layers, c.kv_heads, c.head_dim, num_blocks=NUM_BLOCKS, device=DEVICE)
 
     def run(self):
-        """Run rounds forever; when nobody is seated, sleep until someone joins the waiting line."""
+        """Run rounds forever."""
         while True:
-            self.seated = [s for s in self.seated if not s.done and not s.cancelled]
-            if not self.seated and self.stopwatches.rounds:
-                self.stopwatches.report()
-            new = [] if self.seated else [self.waiting.get()]
-            while len(self.seated) + len(new) < MAX_BATCH and not self.waiting.empty():
-                new.append(self.waiting.get_nowait())
-            try:
-                with torch.no_grad():
-                    for seat in new:
-                        if not seat.cancelled:
-                            self.prefill(seat)
-                            self.seated.append(seat)
-                    active = [s for s in self.seated if not s.done]
-                    if active:
-                        self.decode_round(active)
-            except Exception:
-                traceback.print_exc()
-                for seat in self.seated + new:
-                    seat.send(None)
-                self.seated = []
+            self.run_round()
+
+    def run_round(self):
+        """Free finished users, sleep if nobody is seated or waiting, seat whoever fits, then decode one token for everyone."""
+        self.leave([s for s in self.seated if s.done or s.cancelled])
+        if not self.seated and self.stopwatches.rounds:
+            self.stopwatches.report()
+        if not self.seated and not self.line:
+            self.line.append(self.waiting.get())
+        while not self.waiting.empty():
+            self.line.append(self.waiting.get_nowait())
+        try:
+            with torch.no_grad():
+                for seat in self.admit():
+                    self.seated.append(seat)
+                    self.prefill(seat)
+                active = [s for s in self.seated if not s.done]
+                if active:
+                    self.decode_round(active)
+        except Exception:
+            traceback.print_exc()
+            for seat in self.seated:
+                seat.send(None)
+            self.leave(self.seated)
+
+    def admit(self):
+        """Take people from the front of the line while there is a seat and enough free blocks for prompt + max_tokens."""
+        admitted = []
+        while self.line and len(self.seated) + len(admitted) < MAX_BATCH:
+            seat = self.line[0]
+            if seat.cancelled:
+                self.line.popleft()
+                continue
+            needed = self.allocator.blocks_for(len(seat.prompt_ids) + seat.max_tokens)
+            if needed > self.allocator.num_free():
+                break
+            seat.table = self.allocator.allocate(needed)
+            admitted.append(self.line.popleft())
+        return admitted
+
+    def leave(self, seats):
+        """Remove these users from their seats and give their blocks back to the pool."""
+        for seat in seats:
+            self.allocator.free(seat.table)
+            seat.table = []
+        self.seated = [s for s in self.seated if s not in seats]
 
     def accept(self, seat, token_id):
         """Send a new token to its user; finish them on the end token or when they reach max_tokens."""
@@ -142,37 +169,22 @@ class BatchEngine:
             seat.send(None)
 
     def prefill(self, seat):
-        """Read the whole prompt once, keep its KV cache, and pick the first token."""
-        out = model.model(torch.tensor([seat.prompt_ids], device=DEVICE), use_cache=True)
-        seat.cache, seat.length = layer_kv(out.past_key_values), len(seat.prompt_ids)
-        self.accept(seat, sample(model.lm_head(out.last_hidden_state[:, -1]))[0])
+        """Read the whole prompt once, store its K and V in the user's blocks, and pick the first token."""
+        hidden = model.prefill(seat.prompt_ids, seat.table, self.pool)
+        seat.length = len(seat.prompt_ids)
+        self.accept(seat, sample(model.logits(hidden[None]))[0])
 
     def decode_round(self, seats):
-        """Left-pad every user's KV cache to the same length, run one step for all of them, then cut the padding off again."""
+        """One token for every seated user: the model writes and gathers K and V through the block tables."""
         self.stopwatches.start(len(seats))
-        longest = max(s.length for s in seats)
-        cache = DynamicCache()
-        for layer in range(N_LAYERS):
-            keys = torch.cat([F.pad(s.cache[layer][0], (0, 0, longest - s.length, 0)) for s in seats])
-            values = torch.cat([F.pad(s.cache[layer][1], (0, 0, longest - s.length, 0)) for s in seats])
-            cache.update(keys, values, layer)
-        mask = torch.tensor([[0] * (longest - s.length) + [1] * (s.length + 1) for s in seats], device=DEVICE)
-        positions = torch.tensor([[s.length] for s in seats], device=DEVICE)
-        inputs = torch.tensor([[s.last_token] for s in seats], device=DEVICE)
-        self.stopwatches.lap("pad/concat")
-        out = model.model(input_ids=inputs, past_key_values=cache, attention_mask=mask,
-                          position_ids=positions, use_cache=True)
-        logits = model.lm_head(out.last_hidden_state[:, -1])
+        hidden = model.decode([s.last_token for s in seats], [s.table for s in seats],
+                              [s.length for s in seats], self.pool)
+        logits = model.logits(hidden)
         self.stopwatches.lap("forward")
         next_tokens = sample(logits)
         self.stopwatches.lap("sampling")
-        batch_kv = layer_kv(out.past_key_values)
-        for i, seat in enumerate(seats):
-            start = longest - seat.length
-            seat.cache = [(k[i:i + 1, :, start:], v[i:i + 1, :, start:]) for k, v in batch_kv]
-            seat.length += 1
-        self.stopwatches.lap("slice-back")
         for seat, token_id in zip(seats, next_tokens):
+            seat.length += 1
             self.accept(seat, token_id)
         self.stopwatches.lap("sending")
 
