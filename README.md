@@ -50,6 +50,7 @@ Results are saved in `results/<label>.json`, with every token's arrival time.
 | 9 | How attention handles GQA (9 query heads, 3 K/V heads) | **SDPA with `enable_gqa=True`** instead of copying K/V 3× with `repeat_kv` | One call, no copy written by us, and it takes the mask paged attention will need. Measured on MPS: about the same speed as `repeat_kv`, so the choice is about simpler code, not speed |
 | 10 | How big the block pool is | **A setting**, default **1,920 blocks** (30 users × 1,024 tokens, 1.32 GiB) | The server never runs out at the default, and tests can use a tiny pool (6 blocks of 4 tokens) to force the "pool full" case |
 | 11 | What the allocator does when it can't satisfy a request | **All or nothing**: it raises `PoolFull` and hands out no blocks; freeing a block that isn't in use also fails without changing anything | A half-seated user or a half-freed list would leave the pool in a state nobody can reason about |
+| 12 | Shape of the pool | One K and one V tensor per layer, **`[blocks, block_size, kv_heads, head_dim]`**; token `n` of a user lives in block `table[n // 16]`, slot `n % 16` | After a gather, `blocks × block_size` merge into one token axis for free, and swapping heads and tokens is only a view. With heads before slots, the swap would come before the merge and force a copy |
 
 Open: the admission rule when the pool is full, and whether to keep the 30-seat
 cap.

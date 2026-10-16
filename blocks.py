@@ -1,5 +1,7 @@
 from collections import deque
 
+import torch
+
 BLOCK_SIZE = 16
 DEFAULT_NUM_BLOCKS = 1920
 DUMMY_BLOCK = 0
@@ -55,3 +57,32 @@ class BlockAllocator:
         assert free | self.used == set(range(1, self.num_blocks)), "a block went missing"
         assert DUMMY_BLOCK not in free | self.used, "the dummy block was handed out"
 
+
+class KVPool:
+    """The real memory behind the blocks: one K and one V tensor per layer, shaped [blocks, block_size, kv_heads, head_dim]."""
+
+    def __init__(self, layers, kv_heads, head_dim, num_blocks=DEFAULT_NUM_BLOCKS, block_size=BLOCK_SIZE,
+                 device="cpu", dtype=torch.float32):
+        shape = (num_blocks, block_size, kv_heads, head_dim)
+        self.block_size, self.device = block_size, device
+        self.k = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(layers)]
+        self.v = [torch.zeros(shape, device=device, dtype=dtype) for _ in range(layers)]
+
+    def locations(self, table, start, count):
+        """The (block, slot) of each token from position start to start + count - 1, as two tensors."""
+        positions = range(start, start + count)
+        blocks = [table[n // self.block_size] for n in positions]
+        slots = [n % self.block_size for n in positions]
+        return torch.tensor(blocks, device=self.device), torch.tensor(slots, device=self.device)
+
+    def write(self, layer, blocks, slots, k, v):
+        """Store K and V of shape [tokens, kv_heads, head_dim] at the given blocks and slots of one layer."""
+        self.k[layer][blocks, slots] = k
+        self.v[layer][blocks, slots] = v
+
+    def read(self, layer, table, length):
+        """One user's first length tokens of K and V for one layer, gathered through their block table."""
+        index = torch.tensor(table, device=self.device)
+        k = self.k[layer][index].flatten(0, 1)[:length]
+        v = self.v[layer][index].flatten(0, 1)[:length]
+        return k, v
