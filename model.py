@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 
+from blocks import DUMMY_BLOCK
+
 MODEL_NAME = "HuggingFaceTB/SmolLM2-135M"
 
 
@@ -42,6 +44,16 @@ def rotate(x, cos, sin):
     return x * cos + torch.cat([-x[..., half:], x[..., :half]], dim=-1) * sin
 
 
+def decode_attention(q, k, v, mask):
+    """Attention for one new token per user; each group of query heads is reshaped onto its shared K/V head, so nothing is copied."""
+    users, heads, _, head_dim = q.shape
+    groups = k.shape[1]
+    q = q.view(users, groups, heads // groups, head_dim)
+    scores = (q @ k.transpose(-1, -2)) / head_dim ** 0.5
+    weights = scores.masked_fill(~mask, float("-inf")).softmax(-1)
+    return (weights @ v).view(users, heads, 1, head_dim)
+
+
 class SmolLM2:
     """Our own SmolLM2 forward pass: plain tensors and functions, no cache yet."""
 
@@ -72,16 +84,20 @@ class SmolLM2:
         weights = {key: value.to(device, torch.float32) for key, value in load_file(folder / "model.safetensors").items()}
         return cls(config, weights)
 
-    def attention(self, x, layer, cos, sin):
-        """Causal self-attention where every group of query heads shares one K/V head (GQA)."""
+    def qkv(self, x, layer, cos, sin):
+        """Project x to Q, K and V shaped [batch, heads, length, head_dim], with RoPE applied to Q and K."""
         c = self.config
         batch, length, _ = x.shape
         q = F.linear(x, layer["q"]).view(batch, length, c.heads, c.head_dim).transpose(1, 2)
         k = F.linear(x, layer["k"]).view(batch, length, c.kv_heads, c.head_dim).transpose(1, 2)
         v = F.linear(x, layer["v"]).view(batch, length, c.kv_heads, c.head_dim).transpose(1, 2)
-        q, k = rotate(q, cos, sin), rotate(k, cos, sin)
+        return rotate(q, cos, sin), rotate(k, cos, sin), v
+
+    def attention(self, x, layer, cos, sin):
+        """Causal self-attention where every group of query heads shares one K/V head (GQA)."""
+        q, k, v = self.qkv(x, layer, cos, sin)
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
-        return F.linear(out.transpose(1, 2).reshape(batch, length, -1), layer["o"])
+        return F.linear(out.transpose(1, 2).flatten(2), layer["o"])
 
     def mlp(self, x, layer):
         """SwiGLU: a SiLU-gated path times a plain path, projected back down."""
@@ -101,6 +117,48 @@ class SmolLM2:
         for layer in self.layers:
             x = self.block(x, layer, cos, sin)
         return rms_norm(x, self.norm, self.config.eps)
+
+    def prefill(self, ids, table, pool):
+        """Run one user's prompt, store its K and V in their blocks, and return the last position's hidden state."""
+        length = len(ids)
+        ids = torch.tensor([ids], device=pool.device)
+        positions = torch.arange(length, device=pool.device)[None]
+        cos, sin = rope_tables(positions, self.config.head_dim, self.config.rope_theta)
+        cos, sin = cos[:, None], sin[:, None]
+        blocks, slots = pool.locations(table, 0, length)
+        x = F.embedding(ids, self.embed)
+        for i, layer in enumerate(self.layers):
+            h = rms_norm(x, layer["attn_norm"], self.config.eps)
+            q, k, v = self.qkv(h, layer, cos, sin)
+            pool.write(i, blocks, slots, k[0].transpose(0, 1), v[0].transpose(0, 1))
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            x = x + F.linear(out.transpose(1, 2).flatten(2), layer["o"])
+            x = x + self.mlp(rms_norm(x, layer["mlp_norm"], self.config.eps), layer)
+        return rms_norm(x[:, -1], self.norm, self.config.eps)[0]
+
+    def decode(self, tokens, tables, lengths, pool):
+        """One step for many users: write each new token's K and V into the pool, gather everyone's blocks, attend."""
+        users, bs, device = len(tokens), pool.block_size, pool.device
+        used = [n // bs + 1 for n in lengths]
+        width = max(used)
+        index = torch.tensor([table[:u] + [DUMMY_BLOCK] * (width - u) for table, u in zip(tables, used)], device=device)
+        blocks = torch.tensor([table[n // bs] for table, n in zip(tables, lengths)], device=device)
+        slots = torch.tensor([n % bs for n in lengths], device=device)
+        positions = torch.tensor(lengths, device=device)
+        mask = (torch.arange(width * bs, device=device)[None] <= positions[:, None])[:, None, None]
+        cos, sin = rope_tables(positions[:, None], self.config.head_dim, self.config.rope_theta)
+        cos, sin = cos[:, None], sin[:, None]
+        x = F.embedding(torch.tensor(tokens, device=device)[:, None], self.embed)
+        for i, layer in enumerate(self.layers):
+            h = rms_norm(x, layer["attn_norm"], self.config.eps)
+            q, k, v = self.qkv(h, layer, cos, sin)
+            pool.write(i, blocks, slots, k[:, :, 0], v[:, :, 0])
+            k_all = pool.k[i][index].flatten(1, 2).transpose(1, 2)
+            v_all = pool.v[i][index].flatten(1, 2).transpose(1, 2)
+            out = decode_attention(q, k_all, v_all, mask)
+            x = x + F.linear(out.transpose(1, 2).flatten(2), layer["o"])
+            x = x + self.mlp(rms_norm(x, layer["mlp_norm"], self.config.eps), layer)
+        return rms_norm(x[:, 0], self.norm, self.config.eps)
 
     def logits(self, hidden):
         """Scores for every vocabulary token, using the embedding table as the LM head (tied weights)."""
