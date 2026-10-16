@@ -23,6 +23,7 @@ CONTEXT_LENGTH = 1024
 DEFAULT_MAX_TOKENS = 16
 TEMPERATURE, TOP_K = 0.7, 10
 WELCOME_TEXT = "hi! welcome"
+PARTS = ("pad/concat", "forward", "sampling", "slice-back", "sending")
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.float32).to(DEVICE).eval()
@@ -64,16 +65,56 @@ def layer_kv(cache):
     return [(layer.keys, layer.values) for layer in cache.layers]
 
 
+def gpu_wait():
+    """Block until the GPU has finished its queued work, so a stopwatch times the work and not just the queueing."""
+    if DEVICE == "mps":
+        torch.mps.synchronize()
+
+
+class Stopwatches:
+    """Total time spent in each part of the decode rounds since the last report."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Set every total back to zero."""
+        self.totals, self.rounds, self.users, self.last = dict.fromkeys(PARTS, 0.0), 0, 0, 0.0
+
+    def start(self, users):
+        """Start timing a new round of this many users."""
+        gpu_wait()
+        self.rounds, self.users, self.last = self.rounds + 1, self.users + users, time.perf_counter()
+
+    def lap(self, part):
+        """Add the time since the previous lap to this part."""
+        gpu_wait()
+        now = time.perf_counter()
+        self.totals[part] += now - self.last
+        self.last = now
+
+    def report(self):
+        """Print each part's total, its average per round and its share of the time, then start over."""
+        total = sum(self.totals.values())
+        print(f"decode rounds: {self.rounds}, average batch {self.users / self.rounds:.1f} users")
+        print(f"  {'part':<11} {'total ms':>9} {'ms/round':>9} {'share':>6}")
+        for part, seconds in list(self.totals.items()) + [("all", total)]:
+            print(f"  {part:<11} {seconds * 1000:>9.0f} {seconds * 1000 / self.rounds:>9.2f} {seconds / total:>6.0%}")
+        self.reset()
+
+
 class BatchEngine:
     """Continuous batching: one thread runs rounds; each round seats people from the waiting line, then gives every seated user one token."""
 
     def __init__(self):
-        self.waiting, self.seated = queue.Queue(), []
+        self.waiting, self.seated, self.stopwatches = queue.Queue(), [], Stopwatches()
 
     def run(self):
         """Run rounds forever; when nobody is seated, sleep until someone joins the waiting line."""
         while True:
             self.seated = [s for s in self.seated if not s.done and not s.cancelled]
+            if not self.seated and self.stopwatches.rounds:
+                self.stopwatches.report()
             new = [] if self.seated else [self.waiting.get()]
             while len(self.seated) + len(new) < MAX_BATCH and not self.waiting.empty():
                 new.append(self.waiting.get_nowait())
@@ -108,6 +149,7 @@ class BatchEngine:
 
     def decode_round(self, seats):
         """Left-pad every user's KV cache to the same length, run one step for all of them, then cut the padding off again."""
+        self.stopwatches.start(len(seats))
         longest = max(s.length for s in seats)
         cache = DynamicCache()
         for layer in range(N_LAYERS):
@@ -117,15 +159,22 @@ class BatchEngine:
         mask = torch.tensor([[0] * (longest - s.length) + [1] * (s.length + 1) for s in seats], device=DEVICE)
         positions = torch.tensor([[s.length] for s in seats], device=DEVICE)
         inputs = torch.tensor([[s.last_token] for s in seats], device=DEVICE)
+        self.stopwatches.lap("pad/concat")
         out = model.model(input_ids=inputs, past_key_values=cache, attention_mask=mask,
                           position_ids=positions, use_cache=True)
-        next_tokens = sample(model.lm_head(out.last_hidden_state[:, -1]))
+        logits = model.lm_head(out.last_hidden_state[:, -1])
+        self.stopwatches.lap("forward")
+        next_tokens = sample(logits)
+        self.stopwatches.lap("sampling")
         batch_kv = layer_kv(out.past_key_values)
-        for i, (seat, token_id) in enumerate(zip(seats, next_tokens)):
+        for i, seat in enumerate(seats):
             start = longest - seat.length
             seat.cache = [(k[i:i + 1, :, start:], v[i:i + 1, :, start:]) for k, v in batch_kv]
             seat.length += 1
+        self.stopwatches.lap("slice-back")
+        for seat, token_id in zip(seats, next_tokens):
             self.accept(seat, token_id)
+        self.stopwatches.lap("sending")
 
 
 engine = BatchEngine()
