@@ -44,14 +44,14 @@ def rotate(x, cos, sin):
     return x * cos + torch.cat([-x[..., half:], x[..., :half]], dim=-1) * sin
 
 
-def decode_attention(q, k, v, mask):
-    """Attention for one new token per user; each group of query heads is reshaped onto its shared K/V head, so nothing is copied."""
-    users, heads, _, head_dim = q.shape
+def paged_attention(q, k, v, mask):
+    """Attention over gathered K and V; each group of query heads is reshaped onto its shared K/V head, so nothing is copied."""
+    users, heads, length, head_dim = q.shape
     groups = k.shape[1]
-    q = q.view(users, groups, heads // groups, head_dim)
-    scores = (q @ k.transpose(-1, -2)) / head_dim ** 0.5
+    q = q.reshape(users, groups, heads // groups, length, head_dim)
+    scores = (q @ k[:, :, None].transpose(-1, -2)) / head_dim ** 0.5
     weights = scores.masked_fill(~mask, float("-inf")).softmax(-1)
-    return (weights @ v).view(users, heads, 1, head_dim)
+    return (weights @ v[:, :, None]).reshape(users, heads, length, head_dim)
 
 
 class SmolLM2:
@@ -118,20 +118,22 @@ class SmolLM2:
             x = self.block(x, layer, cos, sin)
         return rms_norm(x, self.norm, self.config.eps)
 
-    def prefill(self, ids, table, pool):
-        """Run one user's prompt, store its K and V in their blocks, and return the last position's hidden state."""
-        length = len(ids)
-        ids = torch.tensor([ids], device=pool.device)
-        positions = torch.arange(length, device=pool.device)[None]
-        cos, sin = rope_tables(positions, self.config.head_dim, self.config.rope_theta)
+    def prefill(self, ids, table, pool, start=0):
+        """Run one user's prompt from token start on (earlier tokens are already in their blocks), store K and V, and return the last hidden state."""
+        length, bs, device = len(ids), pool.block_size, pool.device
+        positions = torch.arange(start, length, device=device)
+        cos, sin = rope_tables(positions[None], self.config.head_dim, self.config.rope_theta)
         cos, sin = cos[:, None], sin[:, None]
-        blocks, slots = pool.locations(table, 0, length)
-        x = F.embedding(ids, self.embed)
+        blocks, slots = pool.locations(table, start, length - start)
+        index = torch.tensor([table[:-(-length // bs)]], device=device)
+        mask = torch.arange(index.shape[1] * bs, device=device)[None] <= positions[:, None]
+        x = F.embedding(torch.tensor([ids[start:]], device=device), self.embed)
         for i, layer in enumerate(self.layers):
-            h = rms_norm(x, layer["attn_norm"], self.config.eps)
-            q, k, v = self.qkv(h, layer, cos, sin)
+            q, k, v = self.qkv(rms_norm(x, layer["attn_norm"], self.config.eps), layer, cos, sin)
             pool.write(i, blocks, slots, k[0].transpose(0, 1), v[0].transpose(0, 1))
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            k_all = pool.k[i][index].flatten(1, 2).transpose(1, 2)
+            v_all = pool.v[i][index].flatten(1, 2).transpose(1, 2)
+            out = paged_attention(q, k_all, v_all, mask)
             x = x + F.linear(out.transpose(1, 2).flatten(2), layer["o"])
             x = x + self.mlp(rms_norm(x, layer["mlp_norm"], self.config.eps), layer)
         return rms_norm(x[:, -1], self.norm, self.config.eps)[0]
@@ -145,7 +147,7 @@ class SmolLM2:
         blocks = torch.tensor([table[n // bs] for table, n in zip(tables, lengths)], device=device)
         slots = torch.tensor([n % bs for n in lengths], device=device)
         positions = torch.tensor(lengths, device=device)
-        mask = (torch.arange(width * bs, device=device)[None] <= positions[:, None])[:, None, None]
+        mask = (torch.arange(width * bs, device=device)[None] <= positions[:, None])[:, None, None, None]
         cos, sin = rope_tables(positions[:, None], self.config.head_dim, self.config.rope_theta)
         cos, sin = cos[:, None], sin[:, None]
         x = F.embedding(torch.tensor(tokens, device=device)[:, None], self.embed)
@@ -155,7 +157,7 @@ class SmolLM2:
             pool.write(i, blocks, slots, k[:, :, 0], v[:, :, 0])
             k_all = pool.k[i][index].flatten(1, 2).transpose(1, 2)
             v_all = pool.v[i][index].flatten(1, 2).transpose(1, 2)
-            out = decode_attention(q, k_all, v_all, mask)
+            out = paged_attention(q, k_all, v_all, mask)
             x = x + F.linear(out.transpose(1, 2).flatten(2), layer["o"])
             x = x + self.mlp(rms_norm(x, layer["mlp_norm"], self.config.eps), layer)
         return rms_norm(x[:, 0], self.norm, self.config.eps)

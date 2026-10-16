@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import queue
 import time
 import traceback
@@ -15,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import AutoTokenizer
 
-from blocks import DEFAULT_NUM_BLOCKS, BlockAllocator, KVPool
+from blocks import DEFAULT_NUM_BLOCKS, BlockAllocator, KVPool, PoolFull
 from model import SmolLM2
 
 HOST, PORT = "127.0.0.1", 8080
@@ -23,6 +24,7 @@ MODEL_NAME = "HuggingFaceTB/SmolLM2-135M"
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 MAX_BATCH = 30
 NUM_BLOCKS = DEFAULT_NUM_BLOCKS
+PREFIX_CACHING = os.environ.get("NANO_PREFIX_CACHE", "1") == "1"
 CONTEXT_LENGTH = 1024
 DEFAULT_MAX_TOKENS = 16
 TEMPERATURE, TOP_K = 0.7, 10
@@ -48,7 +50,7 @@ class Seat:
     def __init__(self, prompt_ids, max_tokens, loop):
         self.prompt_ids, self.max_tokens, self.loop = prompt_ids, max_tokens, loop
         self.tokens = asyncio.Queue()
-        self.table, self.length, self.last_token, self.generated = [], 0, None, 0
+        self.table, self.cached, self.length, self.last_token, self.generated = [], 0, 0, None, 0
         self.done = self.cancelled = False
 
     def send(self, token_id):
@@ -139,19 +141,18 @@ class BatchEngine:
             self.leave(self.seated)
 
     def admit(self):
-        """Take people from the front of the line while there is a seat and enough free blocks for prompt + max_tokens."""
-        admitted = []
-        while self.line and len(self.seated) + len(admitted) < MAX_BATCH:
+        """Yield people from the front of the line, one at a time, while there is a seat and enough blocks for prompt + max_tokens; each is prefilled before the next looks up the cache."""
+        while self.line and len(self.seated) < MAX_BATCH:
             seat = self.line[0]
             if seat.cancelled:
                 self.line.popleft()
                 continue
-            needed = self.allocator.blocks_for(len(seat.prompt_ids) + seat.max_tokens)
-            if needed > self.allocator.num_free():
-                break
-            seat.table = self.allocator.allocate(needed)
-            admitted.append(self.line.popleft())
-        return admitted
+            try:
+                seat.table, seat.cached = self.allocator.allocate_for(
+                    seat.prompt_ids, len(seat.prompt_ids) + seat.max_tokens, use_cache=PREFIX_CACHING)
+            except PoolFull:
+                return
+            yield self.line.popleft()
 
     def leave(self, seats):
         """Remove these users from their seats and give their blocks back to the pool."""
@@ -169,8 +170,10 @@ class BatchEngine:
             seat.send(None)
 
     def prefill(self, seat):
-        """Read the whole prompt once, store its K and V in the user's blocks, and pick the first token."""
-        hidden = model.prefill(seat.prompt_ids, seat.table, self.pool)
+        """Read the part of the prompt that is not cached, store its K and V, remember its full blocks, and pick the first token."""
+        hidden = model.prefill(seat.prompt_ids, seat.table, self.pool, start=seat.cached)
+        if PREFIX_CACHING:
+            self.allocator.register(seat.table, seat.prompt_ids)
         seat.length = len(seat.prompt_ids)
         self.accept(seat, sample(model.logits(hidden[None]))[0])
 

@@ -3,7 +3,10 @@ from transformers import AutoModelForCausalLM
 
 import server
 
-PROMPTS = ["The cat sat on the", "Hello", "In the year 2050, cities around the world will have", "Water boils at"]
+SYSTEM = " ".join(["You are a helpful assistant who answers questions about the history of printing."] * 3)
+PROMPTS = ["The cat sat on the", "Hello", "In the year 2050, cities around the world will have", "Water boils at",
+           SYSTEM + " Who invented the press?", SYSTEM + " When did it reach England?",
+           SYSTEM + " What did it change?"]
 MAX_TOKENS = 20
 
 
@@ -39,7 +42,8 @@ def run_engine(num_blocks):
     engine.leave(list(engine.seated))
     engine.allocator.check()
     print(f"  pool of {num_blocks} blocks: {rounds} rounds, at most {most_seated} seated at once, "
-          f"{engine.allocator.num_free()} of {num_blocks - 1} blocks free at the end")
+          f"{engine.allocator.num_free()} of {num_blocks - 1} blocks free at the end, "
+          f"cached prompt tokens reused per user: {[s.cached for s in seats]}")
     return [answer(s) for s in seats]
 
 
@@ -53,7 +57,7 @@ def main():
         out = hf.generate(ids, max_new_tokens=MAX_TOKENS, do_sample=False, pad_token_id=server.EOS)[0, ids.shape[1]:].tolist()
         expected.append(out[:out.index(server.EOS) + 1] if server.EOS in out else out)
     ok = True
-    for num_blocks in (64, 4):
+    for num_blocks in (64, 9):
         answers = run_engine(num_blocks)
         for prompt, got, want in zip(PROMPTS, answers, expected):
             same = got == want

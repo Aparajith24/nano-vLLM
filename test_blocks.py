@@ -58,7 +58,44 @@ def main():
         print(f"{'B leaves, then is freed again':<34} refused: {error}")
     pool.free(tables.pop("C"))
     step(pool, "everyone leaves", tables, {}, [4, 5, 1, 2, 3])
+    prefix_cases()
     print("all allocator checks passed")
+
+
+def prefix_cases():
+    """Share, revive and evict cached prompt blocks with a toy pool of 8 blocks of 4 tokens."""
+    pool = BlockAllocator(num_blocks=8, block_size=4)
+    shared = [11, 12, 13, 14, 15, 16, 17, 18]
+    a_ids, b_ids = shared + [21, 22], shared + [31]
+    a, cached = pool.allocate_for(a_ids, 12)
+    assert (a, cached) == ([1, 2, 3], 0)
+    pool.register(a, a_ids)
+    b, cached = pool.allocate_for(b_ids, 10)
+    assert (b, cached) == ([1, 2, 4], 8), (b, cached)
+    pool.check()
+    print(f"{'B shares A first 8 tokens':<34} A: {a}  B: {b}  holders: {pool.refs}")
+    pool.free(a)
+    pool.free(b)
+    pool.check()
+    assert pool.refs == {} and pool.cached
+    print(f"{'A and B leave':<34} free: {list(pool.free_blocks)}  still cached: {sorted(pool.cached.values())}")
+    c, cached = pool.allocate_for(shared + [41, 42, 43], 12)
+    assert (c[:2], cached) == ([1, 2], 8), (c, cached)
+    pool.check()
+    print(f"{'C revives the cached blocks':<34} C: {c}  free: {list(pool.free_blocks)}")
+    whole, cached = pool.allocate_for(shared, 8)
+    assert cached == 4, "the last token of a prompt is never served from the cache"
+    pool.free(whole)
+    print(f"{'same 8-token prompt again':<34} cached tokens: {cached} (block 2 holds the last token, recomputed)")
+    pool.free(c)
+    filler = pool.allocate(pool.num_free())
+    pool.check()
+    assert not pool.cached, "taking every free block must evict every cached prompt"
+    pool.free(filler)
+    d, cached = pool.allocate_for(shared + [51], 9)
+    assert cached == 0
+    pool.check()
+    print(f"{'pool fills up, then D arrives':<34} cached tokens: {cached} (evicted)")
 
 
 if __name__ == "__main__":

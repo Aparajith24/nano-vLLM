@@ -111,6 +111,34 @@ def run(device, tokenizer):
             allocator.free(user.table)
         allocator.check()
         print(f"  all blocks back in the pool: {allocator.num_free()} of {allocator.num_blocks - 1}")
+        ok &= prefix_case(ours, hf, tokenizer, device)
+    return ok
+
+
+def prefix_case(ours, hf, tokenizer, device):
+    """User B starts with the same long text as user A, reuses A's cached blocks, and must still match Hugging Face."""
+    system = " ".join(["You are a helpful assistant who answers questions about printing presses."] * 3)
+    a_ids = tokenizer.encode(system + " Who invented it?")
+    b_ids = tokenizer.encode(system + " When did it reach England?")
+    pool, allocator = garbage_pool(ours, 40, device)
+    first = User("A, nothing cached yet", a_ids, *reference(hf, a_ids, 20, device))
+    first.table, cached_a = allocator.allocate_for(a_ids, len(a_ids) + 20)
+    first.compare(ours.logits(ours.prefill(a_ids, first.table, pool)), len(a_ids) - 1)
+    first.length = len(a_ids)
+    allocator.register(first.table, a_ids)
+    second = User("B, shares A's opening", b_ids, *reference(hf, b_ids, 20, device))
+    second.table, cached_b = allocator.allocate_for(b_ids, len(b_ids) + 20)
+    second.compare(ours.logits(ours.prefill(b_ids, second.table, pool, start=cached_b)), len(b_ids) - 1)
+    second.length = len(b_ids)
+    for _ in range(20):
+        decode_round(ours, [first, second], pool, allocator)
+    shared = [block for block in second.table if block in first.table]
+    print(f"    prompts of {len(a_ids)} and {len(b_ids)} tokens; B reused {cached_b} cached tokens in blocks {shared}, "
+          f"prefilled only {len(b_ids) - cached_b}")
+    ok = report("prefix caching", [first, second], device) and cached_a == 0 and cached_b > 0
+    allocator.free(first.table)
+    allocator.free(second.table)
+    allocator.check()
     return ok
 
 

@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from blocks import BlockAllocator, KVPool
-from model import SmolLM2, decode_attention, rms_norm, rope_tables
+from model import SmolLM2, paged_attention, rms_norm, rope_tables
 
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 CASES = [(1, 64), (1, 512), (8, 64), (28, 64), (28, 256), (28, 512)]
@@ -63,7 +63,7 @@ def split_ms(model, pool, tables, lengths, tokens):
         blocks = torch.tensor([t[n // bs] for t, n in zip(tables, lengths)], device=DEVICE)
         slots = torch.tensor([n % bs for n in lengths], device=DEVICE)
         positions = torch.tensor(lengths, device=DEVICE)
-        mask = (torch.arange(width * bs, device=DEVICE)[None] <= positions[:, None])[:, None, None]
+        mask = (torch.arange(width * bs, device=DEVICE)[None] <= positions[:, None])[:, None, None, None]
         cos, sin = rope_tables(positions[:, None], c.head_dim, c.rope_theta)
         cos, sin = cos[:, None], sin[:, None]
         x = F.embedding(torch.tensor(tokens, device=DEVICE)[:, None], model.embed)
@@ -76,7 +76,7 @@ def split_ms(model, pool, tables, lengths, tokens):
             k_all = pool.k[i][index].flatten(1, 2).transpose(1, 2)
             v_all = pool.v[i][index].flatten(1, 2).transpose(1, 2)
             lap("gather")
-            out = decode_attention(q, k_all, v_all, mask)
+            out = paged_attention(q, k_all, v_all, mask)
             lap("attention")
             x = x + F.linear(out.transpose(1, 2).flatten(2), layer["o"])
             x = x + model.mlp(rms_norm(x, layer["mlp_norm"], c.eps), layer)
