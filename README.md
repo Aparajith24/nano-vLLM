@@ -48,9 +48,11 @@ Results are saved in `results/<label>.json`, with every token's arrival time.
 | 7 | How to remove the pad/concat cost | **Write our own SmolLM2 forward pass** (option B) instead of refilling Hugging Face's cache every step (option A) | We control every copy, it is what vLLM does, and it is the only way to attack the 1-user forward overhead later. Option A stays as a fallback |
 | 8 | How attention reads a paged cache | One shared pool of 16-token blocks, one block table per user, tables filled out with a reserved **dummy block 0**, **one gather per layer** for K and one for V, and a mask that hides dummy and unused slots | 60 gathers per round whatever the number of users, instead of 1,800 pads and 60 concatenates. Honest limit: the gather is still a copy; real vLLM reads blocks directly with a GPU kernel we don't have on MPS |
 | 9 | How attention handles GQA (9 query heads, 3 K/V heads) | **SDPA with `enable_gqa=True`** instead of copying K/V 3× with `repeat_kv` | One call, no copy written by us, and it takes the mask paged attention will need. Measured on MPS: about the same speed as `repeat_kv`, so the choice is about simpler code, not speed |
+| 10 | How big the block pool is | **A setting**, default **1,920 blocks** (30 users × 1,024 tokens, 1.32 GiB) | The server never runs out at the default, and tests can use a tiny pool (6 blocks of 4 tokens) to force the "pool full" case |
+| 11 | What the allocator does when it can't satisfy a request | **All or nothing**: it raises `PoolFull` and hands out no blocks; freeing a block that isn't in use also fails without changing anything | A half-seated user or a half-freed list would leave the pool in a state nobody can reason about |
 
-Open: pool size, the admission rule when the pool is full, and whether to keep
-the 30-seat cap.
+Open: the admission rule when the pool is full, and whether to keep the 30-seat
+cap.
 
 ## Results (Apple M4, 16 GB, MPS)
 
