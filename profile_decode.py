@@ -63,7 +63,7 @@ def split_ms(model, pool, tables, lengths, tokens):
         blocks = torch.tensor([t[n // bs] for t, n in zip(tables, lengths)], device=DEVICE)
         slots = torch.tensor([n % bs for n in lengths], device=DEVICE)
         positions = torch.tensor(lengths, device=DEVICE)
-        mask = (torch.arange(width * bs, device=DEVICE)[None] <= positions[:, None])[:, None, None, None]
+        mask = (torch.arange(width * bs, device=DEVICE)[None] <= positions[:, None])[:, None]
         cos, sin = rope_tables(positions[:, None], c.head_dim, c.rope_theta)
         cos, sin = cos[:, None], sin[:, None]
         x = F.embedding(torch.tensor(tokens, device=DEVICE)[:, None], model.embed)

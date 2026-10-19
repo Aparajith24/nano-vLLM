@@ -45,13 +45,14 @@ def rotate(x, cos, sin):
 
 
 def paged_attention(q, k, v, mask):
-    """Attention over gathered K and V; each group of query heads is reshaped onto its shared K/V head, so nothing is copied."""
+    """Attention over gathered K and V with a [batch, queries, keys] mask; each group's query heads and positions are stacked as rows against their shared K/V head, so nothing is copied or broadcast."""
     users, heads, length, head_dim = q.shape
     groups = k.shape[1]
-    q = q.reshape(users, groups, heads // groups, length, head_dim)
-    scores = (q @ k[:, :, None].transpose(-1, -2)) / head_dim ** 0.5
-    weights = scores.masked_fill(~mask, float("-inf")).softmax(-1)
-    return (weights @ v[:, :, None]).reshape(users, heads, length, head_dim)
+    q = q.reshape(users, groups, heads // groups * length, head_dim)
+    scores = (q @ k.transpose(-1, -2)) / head_dim ** 0.5
+    rows = mask.repeat(1, heads // groups, 1)[:, None]
+    weights = scores.masked_fill(~rows, float("-inf")).softmax(-1)
+    return (weights @ v).view(users, heads, length, head_dim)
 
 
 class SmolLM2:
@@ -126,7 +127,7 @@ class SmolLM2:
         cos, sin = cos[:, None], sin[:, None]
         blocks, slots = pool.locations(table, start, length - start)
         index = torch.tensor([table[:-(-length // bs)]], device=device)
-        mask = torch.arange(index.shape[1] * bs, device=device)[None] <= positions[:, None]
+        mask = (torch.arange(index.shape[1] * bs, device=device)[None] <= positions[:, None])[None]
         x = F.embedding(torch.tensor([ids[start:length]], device=device), self.embed)
         for i, layer in enumerate(self.layers):
             q, k, v = self.qkv(rms_norm(x, layer["attn_norm"], self.config.eps), layer, cos, sin)
@@ -147,7 +148,7 @@ class SmolLM2:
         blocks = torch.tensor([table[n // bs] for table, n in zip(tables, lengths)], device=device)
         slots = torch.tensor([n % bs for n in lengths], device=device)
         positions = torch.tensor(lengths, device=device)
-        mask = (torch.arange(width * bs, device=device)[None] <= positions[:, None])[:, None, None, None]
+        mask = (torch.arange(width * bs, device=device)[None] <= positions[:, None])[:, None]
         cos, sin = rope_tables(positions[:, None], self.config.head_dim, self.config.rope_theta)
         cos, sin = cos[:, None], sin[:, None]
         x = F.embedding(torch.tensor(tokens, device=device)[:, None], self.embed)
