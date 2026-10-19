@@ -1,8 +1,8 @@
 {
- "note": "ms per decode round at the 30-user level of bench.py (100 tokens each), from the server's stopwatch reports",
+ "note": "ms per decode round at the 30-user level of bench.py (100 tokens each), from the server's stopwatch reports, all measured in one session on 2026-10-19",
  "rounds": [
-  {"label": "baseline", "users": 28.0, "parts": {"pad/concat": 65.76, "forward": 58.14, "sampling": 5.99, "slice-back + sending": 2.40}},
-  {"label": "paged, SDPA attention", "users": 28.9, "parts": {"pad/concat": 0.0, "forward": 52.71, "sampling": 5.14, "slice-back + sending": 0.03}},
-  {"label": "paged, reshape attention", "users": 29.1, "parts": {"pad/concat": 0.0, "forward": 43.08, "sampling": 4.83, "slice-back + sending": 0.03}}
+  {"label": "baseline", "users": 29.0, "parts": {"pad/concat": 73.89, "forward": 59.64, "sampling": 5.44, "slice-back + sending": 2.63}},
+  {"label": "paged, SDPA attention", "users": 29.7, "parts": {"pad/concat": 0.0, "forward": 52.37, "sampling": 4.78, "slice-back + sending": 0.03}},
+  {"label": "paged, reshape attention", "users": 28.4, "parts": {"pad/concat": 0.0, "forward": 43.89, "sampling": 5.35, "slice-back + sending": 0.03}}
  ]
 }
