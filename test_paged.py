@@ -112,6 +112,25 @@ def run(device, tokenizer):
         allocator.check()
         print(f"  all blocks back in the pool: {allocator.num_free()} of {allocator.num_blocks - 1}")
         ok &= prefix_case(ours, hf, tokenizer, device)
+        ok &= chunked_case(ours, hf, tokenizer, device)
+    return ok
+
+
+def chunked_case(ours, hf, tokenizer, device, chunk=7):
+    """Prefill one prompt a few tokens at a time; every chunk's last position, and the decode after it, must match Hugging Face."""
+    ids = tokenizer.encode(" ".join(["Chunked prefill reads a long prompt a few tokens per round."] * 6))
+    pool, allocator = garbage_pool(ours, 40, device)
+    user = User(f"{len(ids)}-token prompt in chunks of {chunk}", ids, *reference(hf, ids, 20, device))
+    allocator.grow(user.table, len(ids))
+    for start in range(0, len(ids), chunk):
+        end = min(start + chunk, len(ids))
+        user.compare(ours.logits(ours.prefill(ids, user.table, pool, start=start, end=end)), end - 1)
+    user.length = len(ids)
+    for _ in range(20):
+        decode_round(ours, [user], pool, allocator)
+    ok = report(f"chunked prefill ({-(-len(ids) // chunk)} chunks, crossing every block boundary)", [user], device)
+    allocator.free(user.table)
+    allocator.check()
     return ok
 
 

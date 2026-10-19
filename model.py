@@ -118,16 +118,16 @@ class SmolLM2:
             x = self.block(x, layer, cos, sin)
         return rms_norm(x, self.norm, self.config.eps)
 
-    def prefill(self, ids, table, pool, start=0):
-        """Run one user's prompt from token start on (earlier tokens are already in their blocks), store K and V, and return the last hidden state."""
-        length, bs, device = len(ids), pool.block_size, pool.device
+    def prefill(self, ids, table, pool, start=0, end=None):
+        """Run prompt tokens start to end - 1 (earlier ones are already in their blocks), store their K and V, and return the hidden state of the last one."""
+        length, bs, device = len(ids) if end is None else end, pool.block_size, pool.device
         positions = torch.arange(start, length, device=device)
         cos, sin = rope_tables(positions[None], self.config.head_dim, self.config.rope_theta)
         cos, sin = cos[:, None], sin[:, None]
         blocks, slots = pool.locations(table, start, length - start)
         index = torch.tensor([table[:-(-length // bs)]], device=device)
         mask = torch.arange(index.shape[1] * bs, device=device)[None] <= positions[:, None]
-        x = F.embedding(torch.tensor([ids[start:]], device=device), self.embed)
+        x = F.embedding(torch.tensor([ids[start:length]], device=device), self.embed)
         for i, layer in enumerate(self.layers):
             q, k, v = self.qkv(rms_norm(x, layer["attn_norm"], self.config.eps), layer, cos, sin)
             pool.write(i, blocks, slots, k[0].transpose(0, 1), v[0].transpose(0, 1))
