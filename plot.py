@@ -10,12 +10,12 @@ RESULTS = Path(__file__).parent / "results"
 DOCS = Path(__file__).parent / "docs"
 SURFACE, INK, INK_2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e5e1"
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
-RUNS = [("baseline-smollm2", "baseline (padded copies)"),
-        ("paged-smollm2", "paged KV cache, SDPA attention"),
-        ("paged-matmul-smollm2", "paged KV cache, reshape attention"),
-        ("chunked-smollm2", "+ chunked prefill (later, slower session)")]
-CHUNK_RUNS = [("chunk-off-smollm2", "off"), ("chunk-256-smollm2", "256"), ("chunk-512-smollm2", "512"),
-              ("chunk-1024-smollm2", "1024")]
+RUNS = [("baseline-same-session", "baseline (padded copies)"),
+        ("paged-sdpa-same-session", "paged KV cache, SDPA attention"),
+        ("paged-reshape-same-session", "paged KV cache, reshape attention"),
+        ("chunked-same-session", "+ chunked prefill (512 tokens per round)")]
+CHUNK_RUNS = [("chunk-0-same-session", "off"), ("chunk-256-same-session", "256"), ("chunk-512-same-session", "512"),
+              ("chunk-1024-same-session", "1024")]
 
 
 def load(label):
@@ -146,7 +146,7 @@ def chunk_budgets():
 
 def prefix():
     """TTFT with a shared 500-token system prompt, prefix caching off against on."""
-    off, on = load("prefix-off-smollm2"), load("prefix-on-smollm2")
+    off, on = load("prefix-off-same-session"), load("prefix-on-same-session")
     fig, axes = new_figure(width=11, height=4.2, columns=2)
     for ax, key, title in zip(axes, ("ttft_p50_ms", "ttft_p99_ms"), ("TTFT p50", "TTFT p99")):
         positions = range(len(off))

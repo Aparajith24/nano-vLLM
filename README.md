@@ -22,26 +22,30 @@ pads all of them to the same length every decode step.
 ## Headline results
 
 Apple M4, 16 GB, Mac GPU (MPS), SmolLM2-135M at fp32, each user asks for 100
-tokens, at most 30 users decoding at once.
+tokens, at most 30 users decoding at once. **Every number and chart below was
+measured in one session** (2026-10-19), because the same code can run at
+different speeds on different days.
 
 | | Baseline | nano-vLLM | Change |
 |---|---|---|---|
-| Total throughput, 30 users | 189 tok/s | **515 tok/s** | **2.7×** |
-| One decode step, ~30 users | 132 ms | **48 ms** | 2.8× faster |
-| Gap between tokens (ITL p50), 30 users | 164 ms | **46 ms** | 3.6× smaller |
-| Throughput, 1 user | 28 tok/s | **38 tok/s** | 1.4× |
-| TTFT p99, 40 users (10 wait for a seat) | 15.5 s | **5.9 s** | 2.6× smaller |
-| TTFT p50, 30 users sharing a 500-token prompt | 2.4 s (caching off) | **0.70 s** (caching on) | 3.4× smaller |
-| Longest stall for 20 decoding users when 10 long prompts arrive | 3.2 s (chunking off) | **0.70 s** (512-token chunks) | 4.5× shorter |
+| Total throughput, 30 users | 191 tok/s | **475 tok/s** | **2.5×** |
+| One decode step, ~30 users | 142 ms | **49 ms** | 2.9× faster |
+| Gap between tokens (ITL p50), 30 users | 152 ms | **47 ms** | 3.2× smaller |
+| Throughput, 1 user | 30 tok/s | **38 tok/s** | 1.3× |
+| TTFT p99, 40 users (10 wait for a seat) | 16.2 s | **6.4 s** | 2.5× smaller |
+| One decode step, 28 users × 512 tokens of context | ~190 ms (SDPA) | **95 ms** | 2× faster |
+| TTFT p50, 30 users sharing a 500-token prompt | 4.2 s (caching off) | **0.73 s** (caching on) | 5.8× smaller |
+| Longest stall for 20 decoding users when 10 long prompts arrive | 2.1 s (chunking off) | **0.64 s** (512-token chunks) | 3.3× shorter |
 
 ![Total throughput against users](docs/throughput.png)
 
 ![TTFT and ITL against users](docs/latency.png)
 
-The yellow line (chunked prefill) was measured in a later session in which the
-Mac ran slower overall: in that same session, the server with chunking turned
-off reached 418 tok/s at 30 users, against 411 with it on. On these short
-prompts chunking changes nothing; the gap to the green line is the session.
+With these short prompts (7 tokens), chunked prefill has nothing to split, so
+its line sits on top of the green one (471 against 475 tok/s at 30 users). Its
+effect shows only when long prompts arrive, in the chunked prefill test below.
+The attention change matters most for long contexts, which these 100-token
+answers never reach.
 
 ## How it works
 
@@ -133,14 +137,14 @@ python3 test_engine.py      # the server's engine: greedy answers equal HF gener
 The baseline's stopwatches (waiting for the GPU before each reading) showed
 where one decode step goes:
 
-| Part | 1 user | 10 users | 28 users |
+| Part | 1 user | 10 users | 29 users |
 |---|---|---|---|
-| pad/concat | 7.9 (23%) | 23.0 (30%) | **65.8 (50%)** |
-| forward | 23.4 (69%) | 48.3 (63%) | 58.1 (44%) |
-| sampling | 2.3 | 4.0 | 6.0 |
-| slice-back | 0.1 | 0.8 | 2.4 |
-| sending | 0.01 | 0.01 | 0.02 |
-| whole step | 33.7 | 76.2 | 132.3 |
+| pad/concat | 7.9 (24%) | 24.0 (30%) | **73.9 (52%)** |
+| forward | 23.2 (69%) | 50.4 (64%) | 59.6 (42%) |
+| sampling | 2.4 | 3.8 | 5.4 |
+| slice-back | 0.1 | 1.0 | 2.6 |
+| sending | 0.01 | 0.02 | 0.03 |
+| whole step | 33.6 | 79.3 | 141.6 |
 
 At 30 users, every step padded each user's K and V separately in every layer:
 1,800 pads and 60 concatenates, all to build a rectangle that was thrown away
@@ -151,13 +155,24 @@ a copy.
 
 ![One decode step before and after](docs/round.png)
 
-1. **Paged KV cache** (58 ms per step). K and V are written once into their
+1. **Paged KV cache** (57 ms per step). K and V are written once into their
    block and never moved. A step does one gather per layer for K and one for V,
    whatever the number of users.
-2. **Attention by reshape instead of SDPA** (48 ms). On MPS, PyTorch's SDPA
-   with a mask and grouped heads took 3.3–3.5× longer than a plain
-   matmul-softmax-matmul where each group of 3 query heads is reshaped onto its
-   shared K/V head (no copy). Same results to 6e-7.
+2. **Attention by reshape instead of SDPA** (49 ms). Each group of 3 query
+   heads, and every query position, is stacked as rows against its shared K/V
+   head, so attention is two plain matrix multiplies with nothing copied. One
+   layer of decode attention for 28 users × 512 tokens: **4.1 ms with SDPA,
+   0.43 ms by reshape**, same results to 3e-7.
+
+**A regression we caught.** When prefill started using the same attention
+function (for prefix caching), it was generalised in a way that made the
+matmul broadcast K and V across the heads in each group. That quietly made it
+*slower* than SDPA (4.5 ms instead of 1.3 ms per layer), and the prefix-caching
+and first chunked-prefill measurements ran on the slow version. Re-running
+every setup in one session exposed it: the "faster" attention lost to SDPA.
+The fix stacks heads and positions into rows instead of broadcasting, and is
+committed separately. Lesson: re-measure old wins after every change, not only
+the new feature.
 
 ### What is left: attention grows with users × context
 
@@ -165,20 +180,22 @@ a copy.
 
 | Users | Context | Step | norm+QKV+RoPE | write | gather | attention | o_proj+MLP |
 |---|---|---|---|---|---|---|---|
-| 1 | 64 | 19 ms | 11.6 | 6.0 | 6.4 | 8.5 | 13.6 |
-| 28 | 64 | 39 ms | 13.8 | 6.0 | 13.2 | 16.8 | 18.0 |
-| 28 | 512 | 180–190 ms | 13.7 | 6.1 | 45.4 | 134.1 | 16.7 |
+| 1 | 512 | 22 ms | 11.2 | 5.9 | 8.4 | 8.9 | 14.3 |
+| 28 | 64 | 37 ms | 13.6 | 6.2 | 13.3 | 16.7 | 16.3 |
+| 28 | 256 | 61 ms | 13.8 | 6.2 | 28.7 | 30.0 | 17.7 |
+| 28 | 512 | 95 ms | 14.3 | 6.3 | 45.5 | 48.6 | 17.2 |
 
 (The parts add up to more than the step because of the extra GPU waits.)
 
 - **With 1 user, the step is mostly fixed overhead.** Reading all 540 MB of
-  weights at about 120 GB/s takes about 4.5 ms, but the step takes 19 ms: about
+  weights at about 120 GB/s takes about 4.5 ms, but the step takes ~22 ms: about
   30 layers × ~20 small GPU operations, each with a launch cost. Paging cannot
   fix that; fusing operations (or CUDA graphs on NVIDIA) would.
-- **With long contexts, the gather and attention dominate.** A step costs about
-  13–14 ms per 1,000 user-tokens, the same for 30 × 540, 16 × 1,000 and
-  8 × 2,000. The gather is still a copy: real vLLM's PagedAttention kernel reads
-  blocks in place, which needs a custom GPU kernel.
+- **With long contexts, the gather and attention dominate.** From 28 × 64 to
+  28 × 512 tokens, the step grows by about 58 ms, almost all of it gather and
+  attention (about 4.6 ms per extra 1,000 user-tokens). The gather is still a
+  copy: real vLLM's PagedAttention kernel reads blocks in place, which needs a
+  custom GPU kernel.
 - **Shared prompt blocks are gathered once per user.** With a 500-token shared
   system prompt, 30 users gather the same blocks 30 times every step, so
   prefix caching helps prefill (TTFT) but not decode.
@@ -189,13 +206,17 @@ a copy.
 
 Every user sends the same ~500-token system prompt plus their own question.
 With caching on, the first user prefills everything; everyone after reuses the
-cached full blocks and prefills only the last block and their question.
+cached full blocks and prefills only the last block and their question. Both
+runs use the default 512-token chunked prefill.
 
 | Users | TTFT p50 off | TTFT p50 on | TTFT p99 off | TTFT p99 on |
 |---|---|---|---|---|
-| 1 | 321 ms | 205 ms | 321 ms | 205 ms |
-| 10 | 842 ms | 400 ms | 1.56 s | 764 ms |
-| 30 | 2.39 s | **701 ms** | 4.51 s | **1.22 s** |
+| 1 | 370 ms | 201 ms | 370 ms | 201 ms |
+| 10 | 1.94 s | 439 ms | 3.35 s | 690 ms |
+| 30 | 4.25 s | **731 ms** | 9.97 s | **1.51 s** |
+
+With caching off, 30 users × 500 tokens is 15,000 prompt tokens, read 512 per
+round between decode steps; with caching on, most of that never needs reading.
 
 ### Chunked prefill
 
@@ -208,20 +229,20 @@ anyone gets another token.
 
 | Prompt tokens read per round | Longest stall (early users) | ITL p99 (early users) | TTFT p50 (late users) | TTFT p99 (late users) |
 |---|---|---|---|---|
-| no limit | 3,157 ms | 469 ms | 1.5 s | 2.8 s |
-| 256 | 780 ms | 676 ms | 7.0 s | 15.1 s |
-| **512 (default)** | **699 ms** | 599 ms | 4.0 s | 8.7 s |
-| 1,024 | 799 ms | 772 ms | 3.1 s | 6.0 s |
+| no limit | 2,090 ms | 1,032 ms | 1.6 s | 2.9 s |
+| 256 | 711 ms | 412 ms | 4.6 s | 9.8 s |
+| **512 (default)** | **637 ms** | 423 ms | 3.1 s | 6.4 s |
+| 1,024 | 681 ms | 548 ms | 2.2 s | 4.5 s |
 
-- **It is a trade, not a free win.** Chunking cuts the worst freeze for users
-  who are already reading by 4.5×, but the people with long prompts wait longer
-  for their first token, because every round also has to decode all 20 early
-  users while moving the long prompts forward only a slice.
-- **The stall does not shrink below ~700 ms** even with small slices: each
-  round also decodes 30 users whose contexts reach 900 tokens, and that decode
-  step (attention over users × context) is now the bigger part of a round.
-- **The ITL p99 got worse** (469 → 599 ms) while the single worst gap got much
-  better: chunking spreads one 3-second freeze over many slower rounds.
+- **Users already generating get a smoother stream.** The worst freeze drops
+  3.3× and the ITL p99 more than halves (1,032 → 423 ms).
+- **The people with long prompts pay for it.** Their first token comes later
+  (1.6 s → 3.1 s), because each round moves their prompts forward only a slice
+  and also decodes all 20 early users.
+- **The stall does not shrink below ~640 ms** even with small slices: each
+  round also decodes 30 users whose contexts reach 900 tokens, so a round is
+  never cheap. A bigger budget gives late users their answer sooner at the cost
+  of bigger gaps for everyone else.
 
 ## Correctness
 
@@ -263,31 +284,31 @@ Two lessons from testing:
 | 11 | What the allocator does when it can't satisfy a request | **All or nothing**: it raises `PoolFull` and hands out no blocks; a bad free also changes nothing | A half-seated user or a half-freed list would leave the pool in a state nobody can reason about |
 | 12 | Shape of the pool | One K and one V tensor per layer, **`[blocks, block_size, kv_heads, head_dim]`**; token `n` lives in block `table[n // 16]`, slot `n % 16` | After a gather, `blocks × block_size` merge into one token axis for free, and swapping heads and tokens is only a view |
 | 13 | When the pool is full | **Reserve at the door**: a user is seated only if blocks for `prompt + max_tokens` are free; otherwise they wait at the front of the line | It can never run out in the middle of a step, so no user has to be evicted and recomputed. It wastes blocks when answers end early; vLLM's preemption is the upgrade |
-| 14 | Attention in paged prefill and decode | **Matmul-softmax-matmul, with each group of query heads reshaped onto its K/V head**, instead of SDPA | Measured on MPS: 3.3–3.5× faster than SDPA with a mask, same results to 6e-7; took a step at 30 users from 58 ms to 48 ms |
+| 14 | Attention in paged prefill and decode | **Matmul-softmax-matmul, with each group's query heads and positions stacked as rows against its K/V head**, instead of SDPA | Measured on MPS: decode attention 4.1 ms → 0.43 ms per layer at 28 × 512, prefill equal, same results to 3e-7. A first generalisation for prefill broadcast K/V and was slower than SDPA; found by re-measuring and fixed |
 | 15 | Test tolerance for paged decode | **5e-4 on CPU, 1e-3 on MPS**, plus "same token at every step" | Hugging Face's own step-by-step decoding differs from its own full forward by 1e-4; logits reach about 40, so 3e-4 is a relative error of about 1e-5 |
 | 16 | What prefix caching shares | **Full 16-token prompt blocks**, found by a chained hash (each block's fingerprint covers every token before it), with reference counts; the **last prompt token is always recomputed** | A chained hash means a match always covers the whole prefix. The last token must be computed to get its logits. Decode never writes into a full prompt block, so shared blocks are never changed |
 | 17 | What happens to a cached block when its users leave | It goes back to the free list **but keeps its fingerprint**, and is revived if someone asks for it before it is handed out again | Free memory doubles as a cache at no cost; reuse order is oldest freed first |
 | 18 | When users arrive together | **Seat and prefill them one at a time** | Otherwise everyone arriving in the same moment would look up the cache before anyone had filled it, and nobody would share |
 | 19 | Seats | **Keep 30** | Not re-measured for the paged engine; 30 users fit easily in the pool, and keeping the cap makes every before/after comparison fair |
 | 20 | How chunked prefill shares a round | A **budget of prompt tokens per round**; half-read prompts go first, and new users are seated only while budget is left; each chunk's full blocks are added to the prefix cache right away | Half-read prompts first means nobody is overtaken forever. Registering after every chunk keeps prefix caching working: a user seated in a later round reuses the blocks the first user has already read |
-| 21 | Budget size | **512 tokens** (setting `NANO_PREFILL_CHUNK`, 0 = no limit) | Measured 256, 512 and 1,024: 512 gave the shortest worst stall (699 ms) and the best ITL p99 of the three, with a middle cost to the late users' TTFT |
+| 21 | Budget size | **512 tokens** (setting `NANO_PREFILL_CHUNK`, 0 = no limit) | Measured 256, 512 and 1,024 twice: 512 gave the shortest worst stall both times (637 ms in the final run), with a middle cost to the late users' TTFT |
 
 ## Limits
 
 - A tiny model (135M) on a Mac GPU, fp32, one machine, no tensor parallelism,
   no quantization.
 - The paged attention is a gather plus plain PyTorch operations, not a fused
-  GPU kernel, so the gather is still a copy and long contexts cost about
-  13–14 ms per 1,000 user-tokens per step.
+  GPU kernel, so the gather is still a copy and a step for 28 users at 512
+  tokens of context takes ~95 ms, about half of it gathering.
 - New users are prefilled one at a time (one forward pass each, even inside the
   same round), so TTFT grows with the number of users arriving together
-  (575 ms p50 for 30 at once).
+  (about 600 ms p50 for 30 at once).
 - Chunked prefill trades the late users' TTFT for the early users' smoothness;
   the budget is fixed, not adapted to the load.
 - Reserving `prompt + max_tokens` at the door wastes blocks when answers stop
   early; there is no preemption.
-- Measurements on MPS vary between runs (the same decode step measured 98 ms
-  and 190 ms in different sessions); compare runs from the same session.
+- Throughput on MPS moves by a few percent between runs, so all charts come
+  from one session; older result files in `results/` are kept for history.
 - The load test client runs on the same Mac as the server.
 - No live metrics endpoint: the numbers come from `bench.py` and the server's
   stopwatch reports.
