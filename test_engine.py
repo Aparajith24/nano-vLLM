@@ -28,9 +28,9 @@ def answer(seat):
     return ids
 
 
-def run_engine(num_blocks):
-    """Send every prompt to a fresh engine with this many blocks, run rounds until all are done, and return the answers."""
-    server.NUM_BLOCKS = num_blocks
+def run_engine(num_blocks, chunk):
+    """Send every prompt to a fresh engine with this many blocks and prefill budget, run rounds until all are done, and return the answers."""
+    server.NUM_BLOCKS, server.PREFILL_CHUNK = num_blocks, chunk
     engine = server.BatchEngine()
     seats = [server.Seat(server.tokenizer.encode(p), MAX_TOKENS, NowLoop()) for p in PROMPTS]
     for seat in seats:
@@ -41,14 +41,14 @@ def run_engine(num_blocks):
         most_seated, rounds = max(most_seated, len(engine.seated)), rounds + 1
     engine.leave(list(engine.seated))
     engine.allocator.check()
-    print(f"  pool of {num_blocks} blocks: {rounds} rounds, at most {most_seated} seated at once, "
+    print(f"  pool of {num_blocks} blocks, prefill chunk {chunk or 'unlimited'}: {rounds} rounds, at most {most_seated} seated at once, "
           f"{engine.allocator.num_free()} of {num_blocks - 1} blocks free at the end, "
           f"cached prompt tokens reused per user: {[s.cached for s in seats]}")
     return [answer(s) for s in seats]
 
 
 def main():
-    """Greedy answers through the paged engine must equal Hugging Face's generate, with a big pool and with a tiny one."""
+    """Greedy answers through the paged engine must equal Hugging Face's generate, with big and tiny pools and prefill budgets."""
     server.sample = lambda logits: logits.argmax(-1).view(-1).tolist()
     hf = AutoModelForCausalLM.from_pretrained(server.MODEL_NAME, dtype=torch.float32).to(server.DEVICE).eval()
     expected = []
@@ -57,8 +57,8 @@ def main():
         out = hf.generate(ids, max_new_tokens=MAX_TOKENS, do_sample=False, pad_token_id=server.EOS)[0, ids.shape[1]:].tolist()
         expected.append(out[:out.index(server.EOS) + 1] if server.EOS in out else out)
     ok = True
-    for num_blocks in (64, 9):
-        answers = run_engine(num_blocks)
+    for num_blocks, chunk in ((64, 0), (9, 0), (64, 8), (64, 512)):
+        answers = run_engine(num_blocks, chunk)
         for prompt, got, want in zip(PROMPTS, answers, expected):
             same = got == want
             ok &= same
