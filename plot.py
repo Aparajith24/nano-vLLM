@@ -12,7 +12,10 @@ SURFACE, INK, INK_2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e5e1"
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
 RUNS = [("baseline-smollm2", "baseline (padded copies)"),
         ("paged-smollm2", "paged KV cache, SDPA attention"),
-        ("paged-matmul-smollm2", "paged KV cache, reshape attention")]
+        ("paged-matmul-smollm2", "paged KV cache, reshape attention"),
+        ("chunked-smollm2", "+ chunked prefill (later, slower session)")]
+CHUNK_RUNS = [("chunk-off-smollm2", "off"), ("chunk-256-smollm2", "256"), ("chunk-512-smollm2", "512"),
+              ("chunk-1024-smollm2", "1024")]
 
 
 def load(label):
@@ -42,25 +45,32 @@ def new_figure(width=8, height=4.6, columns=1):
 
 
 def lines(ax, key, unit_format, label_at=(40,)):
-    """One line per run against the number of users, with its value written at the chosen user counts."""
+    """One line per run against the number of users, with its value written at the chosen user counts, labels kept apart."""
+    labels = []
     for colour, (label, name) in zip(SERIES, RUNS):
         rows = load(label)
         users, values = [r["users"] for r in rows], [r[key] for r in rows]
         ax.plot(users, values, color=colour, linewidth=2, marker="o", markersize=6,
                 markeredgecolor=SURFACE, markeredgewidth=1.5, label=name)
-        for u, value in zip(users, values):
-            if u in label_at:
-                ax.annotate(unit_format(value), (u, value), xytext=(8, 0), textcoords="offset points",
-                            va="center", color=INK, fontsize=9)
+        labels += [(u, value) for u, value in zip(users, values) if u in label_at]
     ax.set_xticks([1, 10, 30, 40])
     ax.set_xlim(0, 46)
     ax.set_ylim(bottom=0)
+    top = ax.get_ylim()[1]
+    for u in label_at:
+        placed = []
+        for value in sorted(v for x, v in labels if x == u):
+            y = max([value] + [p + top * 0.045 for p in placed[-1:]])
+            placed.append(y)
+            ax.annotate(unit_format(value), (u, value), xytext=(u + 1.2, y), textcoords="data",
+                        va="center", color=INK, fontsize=9)
 
 
 def save(fig, name):
     """Write the figure as a PNG into docs/."""
     DOCS.mkdir(exist_ok=True)
-    fig.tight_layout()
+    if not fig.legends:
+        fig.tight_layout()
     fig.savefig(DOCS / name, dpi=160, facecolor=SURFACE)
     plt.close(fig)
     print(f"saved docs/{name}")
@@ -82,7 +92,9 @@ def latency():
                               ("TTFT p50", "TTFT p99", "ITL p50")):
         lines(ax, key, lambda v: f"{v / 1000:.1f} s" if v >= 1000 else f"{v:.0f} ms")
         style(ax, f"{title} (lower is better)", "milliseconds", "concurrent users")
-    axes[0].legend(frameon=False, labelcolor=INK, loc="upper left", fontsize=8)
+    handles, names = axes[0].get_legend_handles_labels()
+    fig.legend(handles, names, frameon=False, labelcolor=INK, loc="lower center", ncol=4, fontsize=9)
+    fig.tight_layout(rect=(0, 0.07, 1, 1))
     save(fig, "latency.png")
 
 
@@ -113,6 +125,25 @@ def round_breakdown():
     save(fig, "round.png")
 
 
+def chunk_budgets():
+    """Late long prompts arriving while others decode: the early users' worst stall and the late users' wait, per prefill budget."""
+    rows = [(name, json.loads((RESULTS / f"{label}.json").read_text())["summary"][0]) for label, name in CHUNK_RUNS]
+    fig, axes = new_figure(width=11, height=4.2, columns=2)
+    panels = ((axes[0], "early", "itl_max_ms", "Longest stall for users already decoding", SERIES[0]),
+              (axes[1], "late", "ttft_p50_ms", "TTFT p50 for the late long prompts", SERIES[1]))
+    for ax, group, key, title, colour in panels:
+        values = [row[group][key] for _, row in rows]
+        bars = ax.bar(range(len(rows)), values, width=0.55, color=colour, edgecolor=SURFACE, linewidth=2)
+        for bar, value in zip(bars, values):
+            ax.annotate(f"{value / 1000:.1f} s" if value >= 1000 else f"{value:.0f} ms",
+                        (bar.get_x() + bar.get_width() / 2, value), xytext=(0, 4), textcoords="offset points",
+                        ha="center", color=INK, fontsize=9)
+        ax.set_xticks(range(len(rows)))
+        ax.set_xticklabels([name for name, _ in rows])
+        style(ax, f"{title} (lower is better)", "milliseconds", "prefill budget per round (tokens)")
+    save(fig, "chunked.png")
+
+
 def prefix():
     """TTFT with a shared 500-token system prompt, prefix caching off against on."""
     off, on = load("prefix-off-smollm2"), load("prefix-on-smollm2")
@@ -140,6 +171,7 @@ def main():
     throughput()
     latency()
     round_breakdown()
+    chunk_budgets()
     prefix()
 
 

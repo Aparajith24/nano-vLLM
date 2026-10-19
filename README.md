@@ -11,7 +11,9 @@ building the core ideas and measuring each one:
 - a **paged KV cache**: one shared pool of 16-token blocks, a block table per
   user, nothing re-padded or copied between steps;
 - **prefix caching**: users whose prompts start the same share those blocks and
-  skip prefilling them.
+  skip prefilling them;
+- **chunked prefill**: long prompts are read a slice per round, so users who
+  are already generating keep getting tokens.
 
 Every change is measured against a **baseline server** (`baseline_server.py`,
 kept unchanged so it can be re-run) that keeps a separate KV cache per user and
@@ -30,10 +32,16 @@ tokens, at most 30 users decoding at once.
 | Throughput, 1 user | 28 tok/s | **38 tok/s** | 1.4× |
 | TTFT p99, 40 users (10 wait for a seat) | 15.5 s | **5.9 s** | 2.6× smaller |
 | TTFT p50, 30 users sharing a 500-token prompt | 2.4 s (caching off) | **0.70 s** (caching on) | 3.4× smaller |
+| Longest stall for 20 decoding users when 10 long prompts arrive | 3.2 s (chunking off) | **0.70 s** (512-token chunks) | 4.5× shorter |
 
 ![Total throughput against users](docs/throughput.png)
 
 ![TTFT and ITL against users](docs/latency.png)
+
+The yellow line (chunked prefill) was measured in a later session in which the
+Mac ran slower overall: in that same session, the server with chunking turned
+off reached 418 tok/s at 30 users, against 411 with it on. On these short
+prompts chunking changes nothing; the gap to the green line is the session.
 
 ## How it works
 
@@ -46,8 +54,9 @@ tokens, at most 30 users decoding at once.
                                                  2. seat users from the front of the line while a seat
                                                     and enough blocks for prompt + max_tokens are free;
                                                     reuse cached blocks for a known prompt prefix
-                                                 3. prefill each new user (only the uncached part)
-                                                 4. decode one token for every seated user
+                                                 3. prefill up to 512 prompt tokens: half-read prompts
+                                                    first, then new users (only the uncached part)
+                                                 4. decode one token for every user whose prompt is read
  client ◀──SSE, one token each── handler ◀──── tokens through an asyncio.Queue
 
  inside one decode step, for each of the 30 layers:
@@ -95,13 +104,15 @@ curl -N -X POST localhost:8080/v1/completions -H "Content-Type: application/json
 
 `python3 baseline_server.py` runs the baseline instead, on the same port, so
 run only one at a time. `NANO_PREFIX_CACHE=0 python3 server.py` turns prefix
-caching off.
+caching off, and `NANO_PREFILL_CHUNK=0` turns chunked prefill off (any other
+number sets the prompt tokens read per round; the default is 512).
 
 Load test (the server must be running), then redraw the charts:
 
 ```
 nice -n 10 python3 bench.py --label my-run --users 1 10 30 40
 nice -n 10 python3 bench.py --label shared --users 1 10 30 --system-repeats 35
+nice -n 10 python3 bench.py --label late --users 20 --max-tokens 200 --late-users 10 --late-repeats 60
 python3 plot.py
 ```
 
@@ -111,7 +122,7 @@ Tests, each printing what it compares:
 python3 test_blocks.py      # allocator: toy pool, sharing, reviving, eviction
 python3 test_kv_pool.py     # write path: values read back exactly through tables
 python3 test_forward.py     # our forward pass against Hugging Face, piece by piece
-python3 test_paged.py       # paged prefill/decode/prefix against Hugging Face
+python3 test_paged.py       # paged prefill/decode/prefix/chunks against Hugging Face
 python3 test_engine.py      # the server's engine: greedy answers equal HF generate
 ```
 
@@ -186,6 +197,32 @@ cached full blocks and prefills only the last block and their question.
 | 10 | 842 ms | 400 ms | 1.56 s | 764 ms |
 | 30 | 2.39 s | **701 ms** | 4.51 s | **1.22 s** |
 
+### Chunked prefill
+
+![Chunked prefill: stall against wait](docs/chunked.png)
+
+The test: 20 users start generating 200 tokens each; 2 s later, 10 more users
+arrive, each with their own 904-token prompt (no shared prefix). Without
+chunking, the round that reads those prompts reads all 9,040 tokens before
+anyone gets another token.
+
+| Prompt tokens read per round | Longest stall (early users) | ITL p99 (early users) | TTFT p50 (late users) | TTFT p99 (late users) |
+|---|---|---|---|---|
+| no limit | 3,157 ms | 469 ms | 1.5 s | 2.8 s |
+| 256 | 780 ms | 676 ms | 7.0 s | 15.1 s |
+| **512 (default)** | **699 ms** | 599 ms | 4.0 s | 8.7 s |
+| 1,024 | 799 ms | 772 ms | 3.1 s | 6.0 s |
+
+- **It is a trade, not a free win.** Chunking cuts the worst freeze for users
+  who are already reading by 4.5×, but the people with long prompts wait longer
+  for their first token, because every round also has to decode all 20 early
+  users while moving the long prompts forward only a slice.
+- **The stall does not shrink below ~700 ms** even with small slices: each
+  round also decodes 30 users whose contexts reach 900 tokens, and that decode
+  step (attention over users × context) is now the bigger part of a round.
+- **The ITL p99 got worse** (469 → 599 ms) while the single worst gap got much
+  better: chunking spreads one 3-second freeze over many slower rounds.
+
 ## Correctness
 
 Speed means nothing if the answers change, so every step has a test that
@@ -196,7 +233,8 @@ compares against Hugging Face with sampling turned off:
 | `test_forward.py` | Each piece of our model (RMSNorm, RoPE, attention, MLP) and the full logits equal HF's | 0 difference on CPU, ≤ 2.1e-5 on MPS |
 | `test_paged.py` | Paged prefill and decode, teacher-forced across block boundaries, 1 user and 4 users of different lengths (one joining late), with the pool **filled with garbage** first | Same tokens as HF everywhere, logits within 3.5e-4 |
 | `test_paged.py` (prefix) | A user reusing another user's cached blocks still matches HF | Same tokens, logits within 9e-5 |
-| `test_engine.py` | The server's engine gives exactly HF `generate`'s greedy answers, with a big pool and with a pool so small users must wait | 7 of 7 prompts identical |
+| `test_paged.py` (chunks) | A 90-token prompt read 7 tokens at a time, across every block boundary, matches HF at the end of every chunk and through decode | Same tokens, logits within 1.1e-4 |
+| `test_engine.py` | The server's engine gives exactly HF `generate`'s greedy answers, with a big pool, a pool so small users must wait, 8-token chunks and 512-token chunks | 7 of 7 prompts identical in all four |
 | `test_blocks.py`, `test_kv_pool.py` | Tables, free lists and reference counts after every step; values read back exactly | All asserts pass |
 
 Two lessons from testing:
@@ -231,6 +269,8 @@ Two lessons from testing:
 | 17 | What happens to a cached block when its users leave | It goes back to the free list **but keeps its fingerprint**, and is revived if someone asks for it before it is handed out again | Free memory doubles as a cache at no cost; reuse order is oldest freed first |
 | 18 | When users arrive together | **Seat and prefill them one at a time** | Otherwise everyone arriving in the same moment would look up the cache before anyone had filled it, and nobody would share |
 | 19 | Seats | **Keep 30** | Not re-measured for the paged engine; 30 users fit easily in the pool, and keeping the cap makes every before/after comparison fair |
+| 20 | How chunked prefill shares a round | A **budget of prompt tokens per round**; half-read prompts go first, and new users are seated only while budget is left; each chunk's full blocks are added to the prefix cache right away | Half-read prompts first means nobody is overtaken forever. Registering after every chunk keeps prefix caching working: a user seated in a later round reuses the blocks the first user has already read |
+| 21 | Budget size | **512 tokens** (setting `NANO_PREFILL_CHUNK`, 0 = no limit) | Measured 256, 512 and 1,024: 512 gave the shortest worst stall (699 ms) and the best ITL p99 of the three, with a middle cost to the late users' TTFT |
 
 ## Limits
 
@@ -239,8 +279,11 @@ Two lessons from testing:
 - The paged attention is a gather plus plain PyTorch operations, not a fused
   GPU kernel, so the gather is still a copy and long contexts cost about
   13–14 ms per 1,000 user-tokens per step.
-- New users are prefilled one at a time, so TTFT grows with the number of users
-  arriving together (575 ms p50 for 30 at once).
+- New users are prefilled one at a time (one forward pass each, even inside the
+  same round), so TTFT grows with the number of users arriving together
+  (575 ms p50 for 30 at once).
+- Chunked prefill trades the late users' TTFT for the early users' smoothness;
+  the budget is fixed, not adapted to the load.
 - Reserving `prompt + max_tokens` at the door wastes blocks when answers stop
   early; there is no preemption.
 - Measurements on MPS vary between runs (the same decode step measured 98 ms
