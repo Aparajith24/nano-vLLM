@@ -55,12 +55,16 @@ answers never reach.
                                     ▼
                                waiting line ──▶ BatchEngine thread, one round at a time:
                                                  1. free the blocks of finished or disconnected users
-                                                 2. seat users from the front of the line while a seat
-                                                    and enough blocks for prompt + max_tokens are free;
+                                                 2. give every decoding user a block for their next
+                                                    token; if the pool is empty, preempt the newest
+                                                    seated user (free their blocks, send them to the
+                                                    front of the line to recompute later)
+                                                 3. seat users from the front of the line while a seat
+                                                    and enough blocks for their prompt + 1 are free;
                                                     reuse cached blocks for a known prompt prefix
-                                                 3. prefill up to 512 prompt tokens: half-read prompts
+                                                 4. prefill up to 512 prompt tokens: half-read prompts
                                                     first, then new users (only the uncached part)
-                                                 4. decode one token for every user whose prompt is read
+                                                 5. decode one token for every user whose prompt is read
  client ◀──SSE, one token each── handler ◀──── tokens through an asyncio.Queue
 
  inside one decode step, for each of the 30 layers:
@@ -255,7 +259,7 @@ compares against Hugging Face with sampling turned off:
 | `test_paged.py` | Paged prefill and decode, teacher-forced across block boundaries, 1 user and 4 users of different lengths (one joining late), with the pool **filled with garbage** first | Same tokens as HF everywhere, logits within 3.5e-4 |
 | `test_paged.py` (prefix) | A user reusing another user's cached blocks still matches HF | Same tokens, logits within 9e-5 |
 | `test_paged.py` (chunks) | A 90-token prompt read 7 tokens at a time, across every block boundary, matches HF at the end of every chunk and through decode | Same tokens, logits within 1.1e-4 |
-| `test_engine.py` | The server's engine gives exactly HF `generate`'s greedy answers, with a big pool, a pool so small users must wait, 8-token chunks and 512-token chunks | 7 of 7 prompts identical in all four |
+| `test_engine.py` | The server's engine gives exactly HF `generate`'s greedy answers, with a big pool, 8-token chunks, 512-token chunks, and pools so small (5 and 8 usable blocks) that users are preempted and recomputed | 7 of 7 prompts identical in all six; 3–4 preemptions in each tiny pool |
 | `test_blocks.py`, `test_kv_pool.py` | Tables, free lists and reference counts after every step; values read back exactly | All asserts pass |
 
 Two lessons from testing:
@@ -283,7 +287,7 @@ Two lessons from testing:
 | 10 | How big the block pool is | **A setting**, default **1,920 blocks** (30 users × 1,024 tokens, 1.32 GiB) | The server never runs out at the default, and tests use a tiny pool to force the "pool full" case |
 | 11 | What the allocator does when it can't satisfy a request | **All or nothing**: it raises `PoolFull` and hands out no blocks; a bad free also changes nothing | A half-seated user or a half-freed list would leave the pool in a state nobody can reason about |
 | 12 | Shape of the pool | One K and one V tensor per layer, **`[blocks, block_size, kv_heads, head_dim]`**; token `n` lives in block `table[n // 16]`, slot `n % 16` | After a gather, `blocks × block_size` merge into one token axis for free, and swapping heads and tokens is only a view |
-| 13 | When the pool is full | **Reserve at the door**: a user is seated only if blocks for `prompt + max_tokens` are free; otherwise they wait at the front of the line | It can never run out in the middle of a step, so no user has to be evicted and recomputed. It wastes blocks when answers end early; vLLM's preemption is the upgrade |
+| 13 | When the pool is full | *(replaced by 22)* **Reserve at the door**: a user is seated only if blocks for `prompt + max_tokens` are free; otherwise they wait at the front of the line | It can never run out in the middle of a step, so no user has to be evicted and recomputed. It wastes blocks when answers end early; vLLM's preemption is the upgrade |
 | 14 | Attention in paged prefill and decode | **Matmul-softmax-matmul, with each group's query heads and positions stacked as rows against its K/V head**, instead of SDPA | Measured on MPS: decode attention 4.1 ms → 0.43 ms per layer at 28 × 512, prefill equal, same results to 3e-7. A first generalisation for prefill broadcast K/V and was slower than SDPA; found by re-measuring and fixed |
 | 15 | Test tolerance for paged decode | **5e-4 on CPU, 1e-3 on MPS**, plus "same token at every step" | Hugging Face's own step-by-step decoding differs from its own full forward by 1e-4; logits reach about 40, so 3e-4 is a relative error of about 1e-5 |
 | 16 | What prefix caching shares | **Full 16-token prompt blocks**, found by a chained hash (each block's fingerprint covers every token before it), with reference counts; the **last prompt token is always recomputed** | A chained hash means a match always covers the whole prefix. The last token must be computed to get its logits. Decode never writes into a full prompt block, so shared blocks are never changed |
@@ -292,6 +296,8 @@ Two lessons from testing:
 | 19 | Seats | **Keep 30** | Not re-measured for the paged engine; 30 users fit easily in the pool, and keeping the cap makes every before/after comparison fair |
 | 20 | How chunked prefill shares a round | A **budget of prompt tokens per round**; half-read prompts go first, and new users are seated only while budget is left; each chunk's full blocks are added to the prefix cache right away | Half-read prompts first means nobody is overtaken forever. Registering after every chunk keeps prefix caching working: a user seated in a later round reuses the blocks the first user has already read |
 | 21 | Budget size | **512 tokens** (setting `NANO_PREFILL_CHUNK`, 0 = no limit) | Measured 256, 512 and 1,024 twice: 512 gave the shortest worst stall both times (637 ms in the final run), with a middle cost to the late users' TTFT |
+| 22 | How blocks are handed out | **Grow as you go**: seat a user when their prompt + 1 token fits, and add one block each time a decoder crosses a 16-token boundary; when the pool is empty, **preempt by recompute**: free the user's blocks, put them at the front of the line, and later prefill their prompt + answer so far (minus the last token, which is the next decode input, so no token is sampled twice) | Blocks are no longer held for tokens that are never written. Recompute instead of swapping to CPU needs no second memory pool and no copy code, and prefix caching often makes the prompt part free again. On a 9-block test pool: at most 5 users seated instead of 3, 42 rounds instead of 57, same answers. At the default 1,920 blocks the server never preempts, so the earlier benchmarks still hold |
+| 23 | Who gets preempted, and when blocks are found | The **most recently seated** user; decoders get their next block **before** anyone new is seated | The newest user has done the least work, so recomputing them costs least, and the oldest users always finish. Growing first means nobody is seated only to be thrown out in the same round |
 
 ## Limits
 
@@ -305,8 +311,9 @@ Two lessons from testing:
   (about 600 ms p50 for 30 at once).
 - Chunked prefill trades the late users' TTFT for the early users' smoothness;
   the budget is fixed, not adapted to the load.
-- Reserving `prompt + max_tokens` at the door wastes blocks when answers stop
-  early; there is no preemption.
+- Preemption recomputes instead of swapping to CPU, so a preempted user with a
+  long answer pays a full prefill again; there is no limit on how often one
+  user can be preempted.
 - Throughput on MPS moves by a few percent between runs, so all charts come
   from one session; older result files in `results/` are kept for history.
 - The load test client runs on the same Mac as the server.
@@ -317,8 +324,7 @@ Two lessons from testing:
 
 1. **Batched prefill**: prefill everyone who arrives together in one forward
    pass (with a token budget) to cut TTFT.
-2. **Preemption** instead of reserving `max_tokens` up front.
-3. **A real paged attention kernel** (Metal or Triton on NVIDIA) that reads
+2. **A real paged attention kernel** (Metal or Triton on NVIDIA) that reads
    blocks in place, so shared prefix blocks are read once, not gathered per user.
-4. **A `/metrics` endpoint** with TTFT, ITL, batch size and free blocks while the
+3. **A `/metrics` endpoint** with TTFT, ITL, batch size and free blocks while the
    server runs.
