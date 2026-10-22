@@ -46,17 +46,18 @@ class CompletionRequest(BaseModel):
 
 
 class Seat:
-    """One user inside the engine: their block table, how far they have got, and where to send their tokens."""
+    """One user inside the engine: their block table, what they still have to read, their answer so far, and where to send their tokens."""
 
     def __init__(self, prompt_ids, max_tokens, loop):
         self.prompt_ids, self.max_tokens, self.loop = prompt_ids, max_tokens, loop
         self.tokens = asyncio.Queue()
-        self.table, self.cached, self.prefilled, self.length, self.last_token, self.generated = [], 0, 0, 0, None, 0
+        self.ids, self.output, self.preempted = prompt_ids, [], 0
+        self.table, self.cached, self.prefilled, self.length, self.last_token = [], 0, 0, 0, None
         self.done = self.cancelled = False
 
     def reading(self):
-        """True while part of the prompt has not been prefilled yet."""
-        return self.prefilled < len(self.prompt_ids)
+        """True while part of ids has not been prefilled yet."""
+        return self.prefilled < len(self.ids)
 
     def send(self, token_id):
         """Hand a token id, or None for the end, to this user's request handler on the event loop."""
@@ -109,7 +110,7 @@ class Stopwatches:
 
 
 class BatchEngine:
-    """Continuous batching over a paged KV cache: each round seats people whose blocks fit, then gives every seated user one token."""
+    """Continuous batching over a paged KV cache: each round finds every decoder a block for its next token, seats people whose prompts fit, then gives every seated user one token."""
 
     def __init__(self):
         self.waiting, self.line, self.seated, self.stopwatches = queue.Queue(), deque(), [], Stopwatches()
@@ -133,6 +134,7 @@ class BatchEngine:
             self.line.append(self.waiting.get_nowait())
         try:
             with torch.no_grad():
+                self.make_room()
                 self.prefill_step()
                 active = [s for s in self.seated if not s.done and not s.reading()]
                 if active:
@@ -144,7 +146,7 @@ class BatchEngine:
             self.leave(self.seated)
 
     def admit(self):
-        """Yield people from the front of the line, one at a time, while there is a seat and enough blocks for prompt + max_tokens; each starts prefilling before the next looks up the cache."""
+        """Yield people from the front of the line, one at a time, while there is a seat and enough blocks for what they have to read plus one token; each starts prefilling before the next looks up the cache."""
         while self.line and len(self.seated) < MAX_BATCH:
             seat = self.line[0]
             if seat.cancelled:
@@ -152,11 +154,29 @@ class BatchEngine:
                 continue
             try:
                 seat.table, seat.cached = self.allocator.allocate_for(
-                    seat.prompt_ids, len(seat.prompt_ids) + seat.max_tokens, use_cache=PREFIX_CACHING)
+                    seat.ids, len(seat.ids) + 1, use_cache=PREFIX_CACHING)
             except PoolFull:
                 return
             seat.prefilled = seat.cached
             yield self.line.popleft()
+
+    def make_room(self):
+        """Give every seated user who is decoding a block for their next token; when the pool runs out, preempt the newest seated user."""
+        for seat in list(self.seated):
+            while seat in self.seated and not seat.reading():
+                try:
+                    self.allocator.grow(seat.table, seat.length + 1)
+                    break
+                except PoolFull:
+                    self.preempt(self.seated[-1])
+
+    def preempt(self, seat):
+        """Take this user's seat and blocks away and put them at the front of the line, to read their prompt and answer so far again when seated."""
+        self.allocator.free(seat.table)
+        seat.table, seat.cached, seat.prefilled = [], 0, 0
+        seat.ids, seat.preempted = seat.prompt_ids + seat.output[:-1], seat.preempted + 1
+        self.seated.remove(seat)
+        self.line.appendleft(seat)
 
     def prefill_step(self):
         """Spend at most PREFILL_CHUNK prompt tokens this round (0 means no limit): half-read prompts first, then new people while budget is left."""
@@ -169,7 +189,7 @@ class BatchEngine:
                 return
             if seat not in self.seated:
                 self.seated.append(seat)
-            count = int(min(budget, len(seat.prompt_ids) - seat.prefilled))
+            count = int(min(budget, len(seat.ids) - seat.prefilled))
             budget -= count
             self.prefill(seat, count)
 
@@ -182,22 +202,24 @@ class BatchEngine:
 
     def accept(self, seat, token_id):
         """Send a new token to its user; finish them on the end token or when they reach max_tokens."""
-        seat.last_token, seat.generated = token_id, seat.generated + 1
+        seat.last_token = token_id
+        seat.output.append(token_id)
         seat.send(token_id)
-        if token_id == EOS or seat.generated == seat.max_tokens:
+        if token_id == EOS or len(seat.output) == seat.max_tokens:
             seat.done = True
             seat.send(None)
 
     def prefill(self, seat, count):
-        """Read the next count prompt tokens, store their K and V, remember the full blocks so far, and pick the first token once the prompt is done."""
+        """Read the next count tokens of ids, store their K and V, remember the full blocks so far, and pick the first token once a new user's prompt is done."""
         end = seat.prefilled + count
-        hidden = model.prefill(seat.prompt_ids, seat.table, self.pool, start=seat.prefilled, end=end)
+        hidden = model.prefill(seat.ids, seat.table, self.pool, start=seat.prefilled, end=end)
         seat.prefilled = end
         if PREFIX_CACHING:
-            self.allocator.register(seat.table, seat.prompt_ids[:end])
+            self.allocator.register(seat.table, seat.ids[:end])
         if not seat.reading():
-            seat.length = len(seat.prompt_ids)
-            self.accept(seat, sample(model.logits(hidden[None]))[0])
+            seat.length = len(seat.ids)
+            if not seat.output:
+                self.accept(seat, sample(model.logits(hidden[None]))[0])
 
     def decode_round(self, seats):
         """One token for every seated user: the model writes and gathers K and V through the block tables."""

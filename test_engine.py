@@ -29,7 +29,7 @@ def answer(seat):
 
 
 def run_engine(num_blocks, chunk):
-    """Send every prompt to a fresh engine with this many blocks and prefill budget, run rounds until all are done, and return the answers."""
+    """Send every prompt to a fresh engine with this many blocks and prefill budget, run rounds until all are done, and return the answers and preemption count."""
     server.NUM_BLOCKS, server.PREFILL_CHUNK = num_blocks, chunk
     engine = server.BatchEngine()
     seats = [server.Seat(server.tokenizer.encode(p), MAX_TOKENS, NowLoop()) for p in PROMPTS]
@@ -43,12 +43,12 @@ def run_engine(num_blocks, chunk):
     engine.allocator.check()
     print(f"  pool of {num_blocks} blocks, prefill chunk {chunk or 'unlimited'}: {rounds} rounds, at most {most_seated} seated at once, "
           f"{engine.allocator.num_free()} of {num_blocks - 1} blocks free at the end, "
-          f"cached prompt tokens reused per user: {[s.cached for s in seats]}")
-    return [answer(s) for s in seats]
+          f"cached prompt tokens reused per user: {[s.cached for s in seats]}, preemptions per user: {[s.preempted for s in seats]}")
+    return [answer(s) for s in seats], sum(s.preempted for s in seats)
 
 
 def main():
-    """Greedy answers through the paged engine must equal Hugging Face's generate, with big and tiny pools and prefill budgets."""
+    """Greedy answers through the paged engine must equal Hugging Face's generate, with big and tiny pools and prefill budgets; tiny pools must preempt."""
     server.sample = lambda logits: logits.argmax(-1).view(-1).tolist()
     hf = AutoModelForCausalLM.from_pretrained(server.MODEL_NAME, dtype=torch.float32).to(server.DEVICE).eval()
     expected = []
@@ -57,8 +57,11 @@ def main():
         out = hf.generate(ids, max_new_tokens=MAX_TOKENS, do_sample=False, pad_token_id=server.EOS)[0, ids.shape[1]:].tolist()
         expected.append(out[:out.index(server.EOS) + 1] if server.EOS in out else out)
     ok = True
-    for num_blocks, chunk in ((64, 0), (9, 0), (64, 8), (64, 512)):
-        answers = run_engine(num_blocks, chunk)
+    for num_blocks, chunk in ((64, 0), (9, 0), (64, 8), (64, 512), (6, 0), (9, 8)):
+        answers, preemptions = run_engine(num_blocks, chunk)
+        if num_blocks < 10 and not preemptions:
+            ok = False
+            print("    FAIL a tiny pool never preempted anyone")
         for prompt, got, want in zip(PROMPTS, answers, expected):
             same = got == want
             ok &= same
